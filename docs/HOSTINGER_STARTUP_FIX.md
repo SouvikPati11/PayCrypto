@@ -129,3 +129,40 @@ sharing credentials in chat:
 Node compatibility: `engines: >=20` in `package.json`, no
 Node-22-only APIs are used by this fix. Verified on Node 24
 locally; the code path is the same on Node 20.
+
+## Update 2 — entry-file architecture (2026-11-05, second Hostinger failure mode)
+
+Hostinger's runtime logs warned the entry file may be loaded without
+`require.main === module` being true. The previous fix still guarded
+startup with `if (require.main === module)`, so in that loading mode
+`startServer()` was never called at all — a second, independent cause
+of "App did not call listen() within 3 seconds".
+
+Architecture now:
+- `server/index.js` — the Hostinger startup file. It starts the
+  server **unconditionally**: `assertProductionSecrets();`
+  then `startServer();`. There is no `require.main` guard anywhere
+  in the entry code. `package.json` `main` and `start` still point
+  at `server/index.js`, so `node server/index.js` works unchanged.
+- `server/app.js` — all app construction and route registration
+  (moved from the old `index.js`, otherwise unchanged).
+  Importing `server/app.js` does NOT start a server, so tests can
+  import the app without accidentally starting a production server.
+  `server/index.js` re-exports it for any loader that needs the app.
+- `startServer()` starts only once per process: a second call
+  returns the existing server instead of listening again
+  (which would fail with EADDRINUSE).
+- Order preserved: secrets check → immediate `app.listen(PORT,
+  '0.0.0.0')` → async DB readiness + deriver after listen.
+  Weak production secrets still exit 1 before any listening.
+
+Verified, not just read from source:
+- Direct `node server/index.js` and loader-required
+  `server/index.js` (where `require.main !== module`) both listen
+  in ~15–23 ms and answer `/health` — on **Node 20.19.0 and
+  Node 24.22.1**.
+- Regression test in the suite: a loader script in a temp dir
+  requires `server/index.js` and asserts `/health` in <3 s.
+- Start-once test: two `startServer()` calls return the same
+  server object.
+- Full suite: 41/41 pass.

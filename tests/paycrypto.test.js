@@ -532,7 +532,7 @@ test('hostinger: production + MEMORY_DB refuses to create a store (no silent mem
 });
 
 test('hostinger: app listens and /health + /ready are honest with a memory store', async () => {
-  const { app, checkReadiness } = require('../server/index');
+  const { app, checkReadiness } = require('../server/app');
   const server = await new Promise((res) => { const s = app.listen(0, '127.0.0.1', () => res(s)); });
   try {
     const port = server.address().port;
@@ -610,4 +610,57 @@ test('hostinger: server listens within 3s with MySQL hanging (dummy TCP, never r
     const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
     assert.equal(readyRes.status, 503);
   } finally { child.kill('SIGTERM'); await new Promise((res) => dummy.close(res)); }
+});
+
+// ---- HOSTINGER ENTRY regression: server/index.js must start even
+// when require.main !== module (Hostinger loader case) ----
+test('hostinger entry: loader-requiring server/index.js (require.main !== module) still starts the listener', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { spawn } = require('node:child_process');
+  const port = 32400 + Math.floor(Math.random() * 100);
+  // Loader is the main module; index.js is only a required module, so
+  // inside index.js require.main !== module. The old
+  // `if (require.main === module)` guard would have started nothing.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'paycrypto-hostinger-entry-'));
+  const loader = path.join(dir, 'loader.js');
+  const entryAbs = path.join(__dirname, '..', 'server', 'index.js');
+  fs.writeFileSync(loader, `require(${JSON.stringify(entryAbs)});\n`);
+  const child = spawn(process.execPath, [loader], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, PORT: String(port), NODE_ENV: 'development', MEMORY_DB: 'true', ENCRYPTION_KEY: 'a'.repeat(64) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log = '';
+  child.stdout.on('data', (d) => { log += d; });
+  child.stderr.on('data', (d) => { log += d; });
+  try {
+    const { elapsedMs, body } = await waitForHealth(port, 3000);
+    assert.ok(elapsedMs < 3000, `loader case listened in ${elapsedMs}ms, must be <3000ms`);
+    assert.equal(body.ok, true);
+    assert.equal(body.db_ready, true);
+    assert.match(log, /\[startup\] PayCrypto listening on 0\.0\.0\.0:/);
+    assert.match(log, /after \d+ms/);
+  } finally {
+    child.kill('SIGTERM');
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('hostinger entry: startServer() starts only once per process', async () => {
+  const { startServer } = require('../server/app');
+  const first = startServer();
+  const second = startServer();
+  assert.equal(second, first, 'second startServer() must return the existing server, not listen again');
+  // app.listen() is async: wait for the 'listening' event before reading the port.
+  if (!first.listening) await new Promise((res) => first.once('listening', res));
+  const port = first.address().port;
+  assert.ok(port > 0);
+  const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.equal(health.ok, true);
+  // Close all keep-alive connections first, otherwise server.close()
+  // waits for the fetch agent's idle socket and the test runner hangs.
+  if (typeof first.closeAllConnections === 'function') first.closeAllConnections();
+  await new Promise((res) => first.close(res));
 });
