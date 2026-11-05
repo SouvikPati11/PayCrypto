@@ -1,6 +1,7 @@
 'use strict';
 const express = require('express');
-const { hashPassword, verifyPassword, signSession, verifyTotp, newTotpSecret, totpAuthUrl } = require('../lib/auth');
+const { hashPassword, verifyPassword, signSession, verifyTotp, newTotpSecret, totpAuthUrl, tokenHash } = require('../lib/auth');
+const { generateCsrfToken } = require('../lib/csrf');
 const { encryptSecret } = require('../lib/wallet');
 const config = require('../lib/config');
 
@@ -35,20 +36,32 @@ function router(store) {
         if (!verifyTotp(totp, secret)) return res.status(401).json({ error: { message: 'Invalid two-factor code' } });
       }
       await store.logAudit({ actor_type: user.role, actor_id: user.id, action: 'user.login', entity_type: 'user', entity_id: user.id, ip_address: req.ip });
-      res.cookie('paycrypto_session', signSession(user), cookieOpts);
-      return res.json({ user: { id: user.id, email: user.email, role: user.role, merchant_id: user.merchant_id } });
+      const token = signSession(user);
+      // PHASE 1: server-side session record so logout revokes the JWT.
+      await store.createSession({ user_id: user.id, token_hash: tokenHash(token), ip_address: req.ip || null, user_agent: req.headers['user-agent'] || null, expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString() });
+      const csrf = generateCsrfToken();
+      res.cookie('paycrypto_session', token, cookieOpts);
+      res.cookie('paycrypto_csrf', csrf, { sameSite: 'lax', secure: config.env === 'production', maxAge: 24 * 3600 * 1000, path: '/' });
+      return res.json({ user: { id: user.id, email: user.email, role: user.role, merchant_id: user.merchant_id }, csrf_token: csrf });
     } catch (e) { return res.status(500).json({ error: { message: e.message } }); }
   });
 
-  r.post('/logout', (req, res) => { res.clearCookie('paycrypto_session', { path: '/' }); return res.json({ ok: true }); });
+  r.post('/logout', async (req, res) => {
+    const token = req.cookies?.paycrypto_session;
+    if (token) { try { await store.revokeSessionByTokenHash(tokenHash(token)); } catch {} }
+    res.clearCookie('paycrypto_session', { path: '/' });
+    res.clearCookie('paycrypto_csrf', { path: '/' });
+    return res.json({ ok: true });
+  });
 
   // Authenticated helpers: session middleware is attached in index.js and
   // populates req.user; these routes just use it.
   r.post('/totp/setup', async (req, res) => {
     if (!req.user) return res.status(401).json({ error: { message: 'Login required' } });
+    const user = await store.findUserById(req.user.sub);
     const secret = newTotpSecret();
     await store.updateUser(req.user.sub, { totp_secret_encrypted: encryptSecret(secret) });
-    return res.json({ otpauth_url: totpAuthUrl(secret, req.userEmail || 'user'), note: 'Scan with an authenticator app, then confirm with POST /api/auth/totp/enable and a code.' });
+    return res.json({ otpauth_url: totpAuthUrl(secret, user?.email || 'user'), note: 'Scan with an authenticator app, then confirm with POST /api/auth/totp/enable and a code.' });
   });
   r.post('/totp/enable', async (req, res) => {
     if (!req.user) return res.status(401).json({ error: { message: 'Login required' } });

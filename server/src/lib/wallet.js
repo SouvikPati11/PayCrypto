@@ -40,28 +40,50 @@ function isValidBscAddress(address) {
   try { return typeof address === 'string' && ethers.isAddress(address); } catch { return false; }
 }
 
-// Encryption key: 64 hex chars (32 bytes) from ENCRYPTION_KEY, or derived
-// via scrypt from a passphrase for local tooling. Production: set the env var.
-function encryptionKeyBytes() {
+// Encryption key: 64 hex chars (32 bytes) from ENCRYPTION_KEY in production.
+// Passphrase mode (local tooling only) now uses a RANDOM salt stored in the
+// blob — the old static-salt format is still readable for backwards
+// compatibility, but new encryptions never use it (PHASE 1 FIX).
+function encryptionKeyBytes(saltHex) {
   const raw = process.env.ENCRYPTION_KEY || '';
   if (/^[0-9a-fA-F]{64}$/.test(raw)) return Buffer.from(raw, 'hex');
-  if (raw) return crypto.scryptSync(raw, 'paycrypto-wallet-salt', 32);
+  if (raw) {
+    const salt = saltHex ? Buffer.from(saltHex, 'hex') : crypto.randomBytes(16);
+    return { key: crypto.scryptSync(raw, salt, 32), saltHex: salt.toString('hex') };
+  }
   throw new Error('ENCRYPTION_KEY is not configured');
+}
+function _keyAndSalt(saltHex) {
+  const r = encryptionKeyBytes(saltHex);
+  return Buffer.isBuffer(r) ? { key: r, saltHex: '' } : r;
 }
 
 function encryptSecret(plaintext) {
-  const key = encryptionKeyBytes();
+  const { key, saltHex } = _keyAndSalt();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return `${iv.toString('hex')}:${tag.toString('hex')}:${enc.toString('hex')}`;
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${saltHex}:${enc.toString('hex')}`;
 }
 
 function decryptSecret(blob) {
-  const [ivHex, tagHex, dataHex] = String(blob).split(':');
-  if (!ivHex || !tagHex || !dataHex) throw new Error('Invalid encrypted blob');
-  const key = encryptionKeyBytes();
+  const parts = String(blob).split(':');
+  let ivHex, tagHex, saltHex, dataHex;
+  if (parts.length === 4) [ivHex, tagHex, saltHex, dataHex] = parts;
+  else if (parts.length === 3) {
+    // Legacy static-salt format (pre-Phase 1). Readable, never re-emitted.
+    [ivHex, tagHex, dataHex] = parts; saltHex = null;
+    const raw = process.env.ENCRYPTION_KEY || '';
+    if (/^[0-9a-fA-F]{64}$/.test(raw)) { saltHex = ''; }
+    else {
+      const key = crypto.scryptSync(raw, 'paycrypto-wallet-salt', 32);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+      decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+      return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
+    }
+  } else throw new Error('Invalid encrypted blob');
+  const { key } = _keyAndSalt(saltHex || undefined);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
   decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
   return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');

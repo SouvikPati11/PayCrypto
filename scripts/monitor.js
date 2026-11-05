@@ -9,7 +9,7 @@ const { ethers } = require('ethers');
 const config = require('../server/src/lib/config');
 const { createStore } = require('../server/src/lib/store');
 const { validateChainId, verifyTokenContract, parseTransferLog } = require('../server/src/lib/blockchain');
-const { processTransfer } = require('../server/src/lib/monitor');
+const { processTransfer, expirePendingInvoices, reconcileOrphaned } = require('../server/src/lib/monitor');
 
 async function main() {
   const tokenContract = config.usdtContractForNetwork();
@@ -22,6 +22,10 @@ async function main() {
   const provider = new ethers.JsonRpcProvider(config.rpcUrl);
   await validateChainId(provider, config.chainId);
   await verifyTokenContract(provider, tokenContract, { symbol: 'USDT', decimals: 18 });
+  // PHASE 1: expire past-due pending invoices before scanning, so late
+  // payments cannot credit them (processTransfer also guards this).
+  const expiredCount = await expirePendingInvoices(store);
+  if (expiredCount) console.log(`Expired ${expiredCount} past-due pending invoice(s).`);
   const checkpoint = await store.getCheckpoint();
   const currentBlock = await provider.getBlockNumber();
   const fromBlock = checkpoint.last_block_number ? Math.max(checkpoint.last_block_number - config.reorgDepth, 0) : Math.max(currentBlock - 1000, 0);
@@ -31,7 +35,9 @@ async function main() {
   const iface = new ethers.Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
   const logs = await provider.getLogs({ address: tokenContract, fromBlock, toBlock, topics: [iface.getEvent('Transfer').topicHash] });
   let credited = 0; let ignored = 0;
+  const scannedKeys = new Set();
   for (const log of logs) {
+    scannedKeys.add(`${log.transactionHash}:${log.index}`);
     const parsed = parseTransferLog(log, tokenContract);
     if (!parsed) { ignored++; continue; }
     const receipt = await provider.getTransactionReceipt(log.transactionHash);
@@ -61,6 +67,9 @@ async function main() {
     }
     if (result.ignored) ignored++;
   }
+  // PHASE 1: transfers that vanished from the re-scanned range are orphaned.
+  const orphaned = await reconcileOrphaned(store, { scannedKeys, fromBlock, toBlock });
+  if (orphaned) console.log(`Marked ${orphaned} confirming transfer(s) as orphaned (reorg).`);
   // Advance checkpoint only after successful scan + processing.
   await store.setCheckpoint(toBlock, '');
   console.log(`Done. logs=${logs.length} credited=${credited} ignored=${ignored} checkpoint=${toBlock}`);

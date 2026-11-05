@@ -22,6 +22,12 @@ function main() {
   const outDir = path.join(__dirname, '..', 'config');
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, 'wallet.enc.json');
+  // PHASE 1: never silently overwrite an existing wallet. Rotating a seed
+  // must be a deliberate act, or old deposit addresses become unrecoverable.
+  if (fs.existsSync(outFile) && process.env.WALLET_OVERWRITE !== 'true') {
+    console.error('Refusing to overwrite existing', outFile, '— set WALLET_OVERWRITE=true only for a deliberate rotation (see docs/WALLET.md).');
+    process.exitCode = 2; return;
+  }
   fs.writeFileSync(outFile, JSON.stringify({ xpub, encrypted_mnemonic: encryptSecret(mnemonic), created_at: new Date().toISOString() }, null, 2), { mode: 0o600 });
   console.log('HD wallet initialized.');
   console.log('XPUB (safe to store in system_settings.wallet_xpub for watch-only derivation):', xpub);

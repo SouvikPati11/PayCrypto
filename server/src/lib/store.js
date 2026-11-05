@@ -14,6 +14,23 @@ function pool() {
   return pool._p;
 }
 function dupError(msg) { const e = new Error(msg); e.code = 'DUPLICATE'; return e; }
+// PHASE 1: dynamic SQL column names are never taken from user input.
+// These allowlists are the second line of defence: every update method
+// rejects a column it does not recognise, so a future caller cannot
+// turn a patch object into an arbitrary column write.
+const ALLOWED = {
+  user: new Set(['role','merchant_id','totp_enabled','totp_secret_encrypted','status','password_hash']),
+  merchant: new Set(['business_name','contact_email','website','status','user_id']),
+  invoice: new Set(['status','deposit_address','deposit_address_id','expires_at','metadata']),
+  tx: new Set(['status','confirmations','block_hash','block_number']),
+  withdrawal: new Set(['status','tx_hash','admin_note']),
+  sweep: new Set(['status','tx_hash','total_base_units']),
+  webhookLog: new Set(['status','attempts','next_retry_at','response_code']),
+};
+function checkPatch(patch, kind) {
+  for (const k of Object.keys(patch)) if (!ALLOWED[kind].has(k)) throw new Error(`Update rejected: unknown field ${k} for ${kind}`);
+}
+
 
 class MemoryStore {
   constructor() {
@@ -44,7 +61,7 @@ class MemoryStore {
   }
   async findUserByEmail(email) { return [...this.users.values()].find((x) => x.email === email) || null; }
   async findUserById(id) { return this.users.get(Number(id)) || null; }
-  async updateUser(id, patch) { const u = this.users.get(Number(id)); if (!u) return null; Object.assign(u, patch); return u; }
+  async updateUser(id, patch) { checkPatch(patch, 'user'); const u = this.users.get(Number(id)); if (!u) return null; Object.assign(u, patch); return u; }
   async createMerchant(m) {
     const row = { id: this._id(), ...m, status: m.status || 'pending', created_at: new Date().toISOString() };
     this.merchants.set(row.id, row); return row;
@@ -52,7 +69,7 @@ class MemoryStore {
   async findMerchantById(id) { return this.merchants.get(Number(id)) || null; }
   async findMerchantByUserId(uid) { return [...this.merchants.values()].find((x) => x.user_id === Number(uid)) || null; }
   async listMerchants() { return [...this.merchants.values()]; }
-  async updateMerchant(id, patch) { const m = this.merchants.get(Number(id)); if (!m) return null; Object.assign(m, patch); return m; }
+  async updateMerchant(id, patch) { checkPatch(patch, 'merchant'); const m = this.merchants.get(Number(id)); if (!m) return null; Object.assign(m, patch); return m; }
   async allocateDepositAddress({ merchantId, invoiceId }) {
     if (!this.deriver) throw new Error('HD wallet not initialized: set wallet_xpub or run scripts/init-wallet.js (see docs/WALLET.md)');
     for (const a of this.addresses.values()) if (a.invoice_id === Number(invoiceId)) return a;
@@ -77,7 +94,7 @@ class MemoryStore {
   async listInvoices(filter = {}) {
     return [...this.invoices.values()].filter((x) => (!filter.merchant_id || x.merchant_id === Number(filter.merchant_id)) && (!filter.status || x.status === filter.status));
   }
-  async updateInvoice(id, patch) { const i = this.invoices.get(Number(id)); if (!i) return null; Object.assign(i, patch, { updated_at: new Date().toISOString() }); return i; }
+  async updateInvoice(id, patch) { checkPatch(patch, 'invoice'); const i = this.invoices.get(Number(id)); if (!i) return null; Object.assign(i, patch, { updated_at: new Date().toISOString() }); return i; }
   async recordBlockchainTx(tx) {
     const ex = [...this.txs.values()].find((x) => x.tx_hash === tx.tx_hash && x.log_index === tx.log_index);
     if (ex) return { tx: ex, duplicate: true };
@@ -86,7 +103,7 @@ class MemoryStore {
   }
   async getTxById(id) { return this.txs.get(Number(id)) || null; }
   async listTxs(filter = {}) { return [...this.txs.values()].filter((x) => (!filter.merchant_id || x.merchant_id === Number(filter.merchant_id)) && (!filter.status || x.status === filter.status)); }
-  async updateTx(id, patch) { const t = this.txs.get(Number(id)); if (!t) return null; Object.assign(t, patch); return t; }
+  async updateTx(id, patch) { checkPatch(patch, 'tx'); const t = this.txs.get(Number(id)); if (!t) return null; Object.assign(t, patch); return t; }
   async addLedgerEntry(entry) {
     if (this.ledger.find((x) => x.reference_key === entry.reference_key)) throw dupError('Ledger entry already exists for this reference (duplicate credit prevented)');
     const row = { id: this._id(), created_at: new Date().toISOString(), ...entry };
@@ -105,7 +122,7 @@ class MemoryStore {
   }
   async getWithdrawalById(id) { return this.withdrawals.get(Number(id)) || null; }
   async listWithdrawals(filter = {}) { return [...this.withdrawals.values()].filter((x) => (!filter.merchant_id || x.merchant_id === Number(filter.merchant_id)) && (!filter.status || x.status === filter.status)); }
-  async updateWithdrawal(id, patch) {
+  async updateWithdrawal(id, patch) { checkPatch(patch, 'withdrawal');
     const w = this.withdrawals.get(Number(id)); if (!w) return null;
     if (patch.tx_hash) for (const x of this.withdrawals.values()) if (x.tx_hash === patch.tx_hash && x.id !== w.id) throw dupError('Withdrawal tx_hash already recorded');
     Object.assign(w, patch, { updated_at: new Date().toISOString() }); return w;
@@ -117,7 +134,7 @@ class MemoryStore {
     this.sweeps.set(row.id, row); return { job: row, duplicate: false };
   }
   async listSweepJobs() { return [...this.sweeps.values()]; }
-  async updateSweepJob(id, patch) {
+  async updateSweepJob(id, patch) { checkPatch(patch, 'sweep');
     const j = this.sweeps.get(Number(id)); if (!j) return null;
     if (patch.tx_hash) for (const x of this.sweeps.values()) if (x.tx_hash === patch.tx_hash && x.id !== j.id) throw dupError('Sweep tx_hash already recorded');
     Object.assign(j, patch); return j;
@@ -134,9 +151,12 @@ class MemoryStore {
   async listWebhooks(merchantId) { return [...this.webhooks.values()].filter((x) => x.merchant_id === Number(merchantId)); }
   async queueWebhookLog(log) { const row = { id: this._id(), status: 'pending', attempts: 0, created_at: new Date().toISOString(), ...log }; this.webhookLogs.push(row); return row; }
   async listWebhookLogs(merchantId) { return this.webhookLogs.filter((x) => x.merchant_id === Number(merchantId)); }
-  async updateWebhookLog(id, patch) { const l = this.webhookLogs.find((x) => x.id === Number(id)); if (l) Object.assign(l, patch); return l; }
+  async updateWebhookLog(id, patch) { checkPatch(patch, 'webhookLog'); const l = this.webhookLogs.find((x) => x.id === Number(id)); if (l) Object.assign(l, patch); return l; }
   async logAudit(a) { const row = { id: this._id(), created_at: new Date().toISOString(), ...a }; this.audit.push(row); return row; }
   async listAuditLogs() { return [...this.audit].reverse().slice(0, 200); }
+  async createSession(sess) { const row = { id: this._id(), revoked_at: null, created_at: new Date().toISOString(), ...sess }; this.sessions.set(row.token_hash, row); return row; }
+  async findSessionByTokenHash(hash) { const row = this.sessions.get(hash); return row && !row.revoked_at ? row : null; }
+  async revokeSessionByTokenHash(hash) { const row = this.sessions.get(hash); if (row) row.revoked_at = new Date().toISOString(); return !!row; }
   async getCheckpoint() { return this.checkpoint; }
   async setCheckpoint(blockNumber, blockHash) { this.checkpoint = { network: config.network, last_block_number: blockNumber, last_block_hash: blockHash || '' }; return this.checkpoint; }
 }
@@ -153,7 +173,7 @@ class MysqlStore {
   }
   async findUserByEmail(email) { const r = await this.q('SELECT * FROM users WHERE email=?', [email]); return r[0] || null; }
   async findUserById(id) { const r = await this.q('SELECT * FROM users WHERE id=?', [id]); return r[0] || null; }
-  async updateUser(id, patch) {
+  async updateUser(id, patch) { checkPatch(patch, 'user'); 
     const keys = Object.keys(patch); if (!keys.length) return this.findUserById(id);
     await this.q(`UPDATE users SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.findUserById(id);
   }
@@ -161,7 +181,7 @@ class MysqlStore {
   async findMerchantById(id) { const r = await this.q('SELECT * FROM merchants WHERE id=?', [id]); return r[0] || null; }
   async findMerchantByUserId(uid) { const r = await this.q('SELECT * FROM merchants WHERE user_id=?', [uid]); return r[0] || null; }
   async listMerchants() { return this.q('SELECT * FROM merchants ORDER BY id DESC'); }
-  async updateMerchant(id, patch) { const keys = Object.keys(patch); await this.q(`UPDATE merchants SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.findMerchantById(id); }
+  async updateMerchant(id, patch) { checkPatch(patch, 'merchant'); const keys = Object.keys(patch); await this.q(`UPDATE merchants SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.findMerchantById(id); }
   async allocateDepositAddress({ merchantId, invoiceId }) {
     if (!this.deriver) throw new Error('HD wallet not initialized: set wallet_xpub or run scripts/init-wallet.js (see docs/WALLET.md)');
     const conn = await pool().getConnection();
@@ -196,7 +216,7 @@ class MysqlStore {
     if (filter.status) { sql += ' AND status=?'; p.push(filter.status); }
     sql += ' ORDER BY id DESC LIMIT 200'; return this.q(sql, p);
   }
-  async updateInvoice(id, patch) { const keys = Object.keys(patch); await this.q(`UPDATE invoices SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.getInvoiceById(id); }
+  async updateInvoice(id, patch) { checkPatch(patch, 'invoice'); const keys = Object.keys(patch); await this.q(`UPDATE invoices SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.getInvoiceById(id); }
   async recordBlockchainTx(tx) {
     try {
       const r = await this.q('INSERT INTO blockchain_transactions (tx_hash,log_index,block_number,block_hash,from_address,to_address,token_contract,amount_base_units,invoice_id,merchant_id,status,confirmations) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [tx.tx_hash, tx.log_index, tx.block_number, tx.block_hash || null, tx.from_address, tx.to_address, tx.token_contract, tx.amount_base_units, tx.invoice_id || null, tx.merchant_id || null, tx.status || 'pending', tx.confirmations || 0]);
@@ -205,7 +225,7 @@ class MysqlStore {
   }
   async getTxById(id) { const r = await this.q('SELECT * FROM blockchain_transactions WHERE id=?', [id]); return r[0] || null; }
   async listTxs(filter = {}) { let sql = 'SELECT * FROM blockchain_transactions WHERE 1=1'; const p = []; if (filter.merchant_id) { sql += ' AND merchant_id=?'; p.push(filter.merchant_id); } if (filter.status) { sql += ' AND status=?'; p.push(filter.status); } sql += ' ORDER BY id DESC LIMIT 200'; return this.q(sql, p); }
-  async updateTx(id, patch) { const keys = Object.keys(patch); await this.q(`UPDATE blockchain_transactions SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.getTxById(id); }
+  async updateTx(id, patch) { checkPatch(patch, 'tx'); const keys = Object.keys(patch); await this.q(`UPDATE blockchain_transactions SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return this.getTxById(id); }
   async addLedgerEntry(entry) {
     try { const r = await this.q('INSERT INTO ledger_entries (merchant_id,invoice_id,blockchain_tx_id,withdrawal_id,entry_type,amount_base_units,description,reference_key) VALUES (?,?,?,?,?,?,?,?)', [entry.merchant_id, entry.invoice_id || null, entry.blockchain_tx_id || null, entry.withdrawal_id || null, entry.entry_type, entry.amount_base_units, entry.description || '', entry.reference_key]); return { id: r.insertId, ...entry }; }
     catch (e) { if (e.code === 'ER_DUP_ENTRY') throw dupError('Ledger entry already exists for this reference (duplicate credit prevented)'); throw e; }
@@ -215,10 +235,10 @@ class MysqlStore {
   async createWithdrawal(w) { const r = await this.q('INSERT INTO withdrawals (merchant_id,destination_address,amount_base_units,fee_base_units,net_base_units,status) VALUES (?,?,?,?,?,?)', [w.merchant_id, w.destination_address, w.amount_base_units, w.fee_base_units, w.net_base_units, 'pending']); return this.getWithdrawalById(r.insertId); }
   async getWithdrawalById(id) { const r = await this.q('SELECT * FROM withdrawals WHERE id=?', [id]); return r[0] || null; }
   async listWithdrawals(filter = {}) { let sql = 'SELECT * FROM withdrawals WHERE 1=1'; const p = []; if (filter.merchant_id) { sql += ' AND merchant_id=?'; p.push(filter.merchant_id); } if (filter.status) { sql += ' AND status=?'; p.push(filter.status); } sql += ' ORDER BY id DESC LIMIT 200'; return this.q(sql, p); }
-  async updateWithdrawal(id, patch) { const keys = Object.keys(patch); try { await this.q(`UPDATE withdrawals SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); } catch (e) { if (e.code === 'ER_DUP_ENTRY') throw dupError('Withdrawal tx_hash already recorded'); throw e; } return this.getWithdrawalById(id); }
+  async updateWithdrawal(id, patch) { checkPatch(patch, 'withdrawal'); const keys = Object.keys(patch); try { await this.q(`UPDATE withdrawals SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); } catch (e) { if (e.code === 'ER_DUP_ENTRY') throw dupError('Withdrawal tx_hash already recorded'); throw e; } return this.getWithdrawalById(id); }
   async createSweepJob(job) { const ex = await this.q('SELECT * FROM sweep_jobs WHERE job_key=?', [job.job_key]); if (ex[0]) return { job: ex[0], duplicate: true }; const r = await this.q('INSERT INTO sweep_jobs (job_key,treasury_address,status,total_base_units) VALUES (?,?,?,?)', [job.job_key, job.treasury_address, 'pending', job.total_base_units || '0']); const rows = await this.q('SELECT * FROM sweep_jobs WHERE id=?', [r.insertId]); return { job: rows[0], duplicate: false }; }
   async listSweepJobs() { return this.q('SELECT * FROM sweep_jobs ORDER BY id DESC LIMIT 200'); }
-  async updateSweepJob(id, patch) { const keys = Object.keys(patch); await this.q(`UPDATE sweep_jobs SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); const r = await this.q('SELECT * FROM sweep_jobs WHERE id=?', [id]); return r[0] || null; }
+  async updateSweepJob(id, patch) { checkPatch(patch, 'sweep'); const keys = Object.keys(patch); await this.q(`UPDATE sweep_jobs SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); const r = await this.q('SELECT * FROM sweep_jobs WHERE id=?', [id]); return r[0] || null; }
   async createApiKey(k) { const r = await this.q('INSERT INTO api_keys (merchant_id,name,key_prefix,key_hash,live) VALUES (?,?,?,?,?)', [k.merchant_id, k.name, k.key_prefix, k.key_hash, k.live ? 1 : 0]); const rows = await this.q('SELECT * FROM api_keys WHERE id=?', [r.insertId]); return rows[0]; }
   async listApiKeys(merchantId) { return this.q('SELECT id,merchant_id,name,key_prefix,live,last_used_at,revoked_at,created_at FROM api_keys WHERE merchant_id=? ORDER BY id DESC', [merchantId]); }
   async findApiKeyByHash(hash) { const r = await this.q('SELECT * FROM api_keys WHERE key_hash=? AND revoked_at IS NULL', [hash]); return r[0] || null; }
@@ -228,9 +248,12 @@ class MysqlStore {
   async getWebhooksFull(merchantId) { return this.q('SELECT * FROM webhooks WHERE merchant_id=? AND active=1 ORDER BY id DESC', [merchantId]); }
   async queueWebhookLog(log) { const r = await this.q('INSERT INTO webhook_logs (webhook_id,merchant_id,invoice_id,event,payload,signature,status,attempts) VALUES (?,?,?,?,?,?,?,?)', [log.webhook_id, log.merchant_id, log.invoice_id || null, log.event, JSON.stringify(log.payload), log.signature || '', 'pending', 0]); return { id: r.insertId, ...log }; }
   async listWebhookLogs(merchantId) { return this.q('SELECT * FROM webhook_logs WHERE merchant_id=? ORDER BY id DESC LIMIT 200', [merchantId]); }
-  async updateWebhookLog(id, patch) { const keys = Object.keys(patch); await this.q(`UPDATE webhook_logs SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return true; }
+  async updateWebhookLog(id, patch) { checkPatch(patch, 'webhookLog'); const keys = Object.keys(patch); await this.q(`UPDATE webhook_logs SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return true; }
   async logAudit(a) { await this.q('INSERT INTO audit_logs (actor_type,actor_id,action,entity_type,entity_id,details,ip_address) VALUES (?,?,?,?,?,?,?)', [a.actor_type, a.actor_id || null, a.action, a.entity_type || null, a.entity_id || null, JSON.stringify(a.details || {}), a.ip_address || null]); return true; }
   async listAuditLogs() { return this.q('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 200'); }
+  async createSession(sess) { await this.q('INSERT INTO login_sessions (user_id,token_hash,ip_address,user_agent,expires_at) VALUES (?,?,?,?,?)', [sess.user_id, sess.token_hash, sess.ip_address || null, sess.user_agent || null, sess.expires_at || null]); return sess; }
+  async findSessionByTokenHash(hash) { const r = await this.q('SELECT * FROM login_sessions WHERE token_hash=? AND revoked_at IS NULL', [hash]); return r[0] || null; }
+  async revokeSessionByTokenHash(hash) { await this.q('UPDATE login_sessions SET revoked_at=NOW() WHERE token_hash=?', [hash]); return true; }
   async getCheckpoint() { const r = await this.q('SELECT * FROM monitor_checkpoints WHERE network=?', [config.network]); return r[0] || { network: config.network, last_block_number: 0, last_block_hash: '' }; }
   async setCheckpoint(blockNumber, blockHash) { await this.q('INSERT INTO monitor_checkpoints (network,last_block_number,last_block_hash) VALUES (?,?,?) ON DUPLICATE KEY UPDATE last_block_number=VALUES(last_block_number), last_block_hash=VALUES(last_block_hash)', [config.network, blockNumber, blockHash || '']); return this.getCheckpoint(); }
 }

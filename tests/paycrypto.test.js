@@ -43,7 +43,12 @@ test('invoice classification: pending, confirming, paid, underpaid, overpaid, ex
 test('withdrawal validation: limits, fee and insufficient balance', () => {
   const avail = parseUsdt('100');
   assert.equal(validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '5', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' }).ok, false);
-  assert.equal(validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '100', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' }).ok, false);
+  // PHASE 1 (gross semantics): 100 gross with 1 fee is allowed (net 99),
+  // 101 gross exceeds the 100 balance, and 1 gross does not exceed the fee.
+  assert.equal(validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '101', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' }).ok, false);
+  assert.equal(validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '1', feeUsdt: '1', minUsdt: '0.5', maxUsdt: '10000' }).ok, false);
+  const ok100 = validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '100', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' });
+  assert.equal(ok100.ok, true); assert.equal(formatUsdt(ok100.net), '99');
   const ok = validateWithdrawal({ availableBaseUnits: avail, amountUsdt: '50', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' });
   assert.equal(ok.ok, true); assert.equal(formatUsdt(ok.net), '49');
   assert.equal(isValidBscAddress('0x55d398326f99059fF775485246999027B3197955'), true);
@@ -145,4 +150,71 @@ test('store: unique address assignment, duplicate tx never credits twice, sweep 
   await processTransfer(store, { ...transfer, to: addrC.address, value: parseUsdt('10'), txHash: '0x' + '12'.repeat(32) }, { tokenContract: MAINNET_USDT, confirmations: 12, currentBlock: 105 });
   assert.equal((await store.getInvoiceById(inv3.id)).status, 'pending'); // confirming tx exists but invoice stays pending until confirmed credit path runs
   assert.equal(await store.merchantBalance(merchant.id), parseUsdt('14')); // 10 + 4 only
+});
+
+// ---- PHASE 1 tests ----
+const { verifyCsrf, csrfRequired } = require('../server/src/lib/csrf');
+const { expirePendingInvoices, reconcileOrphaned } = require('../server/src/lib/monitor');
+
+test('phase1: CSRF double-submit verifies cookie vs header, API-key exempt', () => {
+  const good = { cookies: { paycrypto_csrf: 'abc123' }, headers: { 'x-csrf-token': 'abc123' }, method: 'POST', user: { sub: 1 } };
+  assert.equal(verifyCsrf(good), true);
+  assert.equal(verifyCsrf({ ...good, headers: { 'x-csrf-token': 'wrong' } }), false);
+  assert.equal(verifyCsrf({ ...good, cookies: {} }), false);
+  assert.equal(csrfRequired({ method: 'GET', user: { sub: 1 } }), false);
+  assert.equal(csrfRequired({ method: 'POST', user: { sub: 1 }, headers: { authorization: 'Bearer pk_test_x' } }), false);
+  assert.equal(csrfRequired({ method: 'POST', user: { sub: 1 }, headers: {} }), true);
+});
+
+test('phase1: passphrase encryption uses a random salt (blobs differ, both decrypt)', () => {
+  process.env.ENCRYPTION_KEY = 'a-local-passphrase-only-not-hex';
+  const a = encryptSecret('secret-value');
+  const b = encryptSecret('secret-value');
+  assert.notEqual(a, b);
+  assert.equal(a.split(':').length, 4);
+  assert.equal(decryptSecret(a), 'secret-value');
+  assert.equal(decryptSecret(b), 'secret-value');
+  process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+});
+
+test('phase1: expired invoice never credits, even on a confirmed late payment', async () => {
+  const store = new MemoryStore();
+  store.setAddressDeriver((i) => deriveAddressFromMnemonic(TEST_MNEMONIC, i));
+  const merchant = await store.createMerchant({ user_id: null, business_name: 'Late', contact_email: 'late@example.com', status: 'approved' });
+  const { invoice } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-EXPIRED', amount_base_units: parseUsdt('10').toString(), expires_at: new Date(Date.now() - 1000).toISOString() });
+  const addr = await store.allocateDepositAddress({ merchantId: merchant.id, invoiceId: invoice.id });
+  await store.updateInvoice(invoice.id, { deposit_address: addr.address, deposit_address_id: addr.id });
+  const r = await processTransfer(store, { from: '0x1111111111111111111111111111111111111111', to: addr.address, value: parseUsdt('10'), txHash: '0x' + 'aa'.repeat(32), logIndex: 0, blockNumber: 100, tokenContract: MAINNET_USDT, receiptStatus: true }, { tokenContract: MAINNET_USDT, confirmations: 12, currentBlock: 112 });
+  assert.equal(r.credited, false);
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'expired');
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+});
+
+test('phase1: expirePendingInvoices + orphan reconcile', async () => {
+  const store = new MemoryStore();
+  store.setAddressDeriver((i) => deriveAddressFromMnemonic(TEST_MNEMONIC, i));
+  const merchant = await store.createMerchant({ user_id: null, business_name: 'Orph', contact_email: 'o@example.com', status: 'approved' });
+  const { invoice } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-ORPH', amount_base_units: parseUsdt('10').toString(), expires_at: new Date(Date.now() - 1000).toISOString() });
+  assert.equal(await expirePendingInvoices(store), 1);
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'expired');
+  // Confirming tx that vanishes from a re-scan is orphaned.
+  const { invoice: inv2 } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-ORPH2', amount_base_units: parseUsdt('10').toString(), expires_at: new Date(Date.now() + 3600_000).toISOString() });
+  const addr = await store.allocateDepositAddress({ merchantId: merchant.id, invoiceId: inv2.id });
+  await store.updateInvoice(inv2.id, { deposit_address: addr.address, deposit_address_id: addr.id });
+  await processTransfer(store, { from: '0x1111111111111111111111111111111111111111', to: addr.address, value: parseUsdt('10'), txHash: '0x' + 'bb'.repeat(32), logIndex: 0, blockNumber: 100, tokenContract: MAINNET_USDT, receiptStatus: true }, { tokenContract: MAINNET_USDT, confirmations: 12, currentBlock: 105 });
+  const confirming = (await store.listTxs({ status: 'confirming' }))[0];
+  assert.ok(confirming);
+  assert.equal(await reconcileOrphaned(store, { scannedKeys: new Set(), fromBlock: 90, toBlock: 110 }), 1);
+  assert.equal((await store.getTxById(confirming.id)).status, 'orphaned');
+});
+
+test('phase1: session revocation + SQL column allowlist', async () => {
+  const store = new MemoryStore();
+  await store.createSession({ user_id: 1, token_hash: 'hash123', ip_address: '127.0.0.1', user_agent: 'test', expires_at: new Date().toISOString() });
+  assert.ok(await store.findSessionByTokenHash('hash123'));
+  await store.revokeSessionByTokenHash('hash123');
+  assert.equal(await store.findSessionByTokenHash('hash123'), null);
+  const merchant = await store.createMerchant({ user_id: null, business_name: 'Allow', contact_email: 'al@example.com', status: 'approved' });
+  const { invoice } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-ALLOW', amount_base_units: parseUsdt('1').toString(), expires_at: new Date(Date.now() + 3600_000).toISOString() });
+  await assert.rejects(() => store.updateInvoice(invoice.id, { amount_base_units: '999' }), /unknown field/);
 });

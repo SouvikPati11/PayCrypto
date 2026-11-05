@@ -23,9 +23,13 @@ function router(store) {
     const sweeps = await store.listSweepJobs();
     const confirmed = txs.filter((t) => t.status === 'confirmed');
     const totalReceived = confirmed.reduce((a, t) => a + BigInt(t.amount_base_units), 0n);
+    // PHASE 1: merchant liabilities are now actually computed (sum of
+    // derived ledger balances), not just described in a note.
+    let totalLiabilities = 0n;
+    for (const m of merchants) totalLiabilities += await store.merchantBalance(m.id);
     return res.json({
       total_merchants: merchants.length, total_invoices: invoices.length, total_payments: txs.length,
-      total_usdt_received: formatUsdt(totalReceived), pending_withdrawals: withdrawals.filter((w) => w.status === 'pending').length,
+      total_usdt_received: formatUsdt(totalReceived), total_merchant_liabilities_usdt: formatUsdt(totalLiabilities), pending_withdrawals: withdrawals.filter((w) => w.status === 'pending').length,
       successful_transactions: confirmed.length, failed_transactions: txs.filter((t) => t.status === 'failed').length,
       deposit_addresses: addresses.length, sweep_jobs: sweeps.length, treasury_address: config.treasuryAddress || null,
       note: 'Merchant liabilities are the sum of merchant ledger balances; treasury balance is read on-chain, not stored here.',
@@ -64,6 +68,13 @@ function router(store) {
     const patch = { status };
     if (tx_hash) patch.tx_hash = tx_hash;
     if (admin_note) patch.admin_note = admin_note;
+    // PHASE 1: balance check at confirmation time. Creation-time checks
+    // alone do not prevent multiple approved withdrawals exceeding the
+    // balance before any of them is confirmed.
+    if (status === 'confirmed' && tx_hash) {
+      const bal = await store.merchantBalance(w.merchant_id);
+      if (BigInt(w.amount_base_units) > bal) return res.status(400).json({ error: { message: 'Insufficient merchant balance to confirm this withdrawal' } });
+    }
     const updated = await store.updateWithdrawal(w.id, patch);
     // Ledger debit happens ONLY when a withdrawal is confirmed on-chain
     // with a tx_hash, in a single store call guarded by reference_key.

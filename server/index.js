@@ -8,7 +8,8 @@ const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 const config = require('./src/lib/config');
 const { createStore } = require('./src/lib/store');
-const { verifySession } = require('./src/lib/auth');
+const { verifySession, tokenHash } = require('./src/lib/auth');
+const { verifyCsrf, csrfRequired } = require('./src/lib/csrf');
 const { deriveAddressFromXpub } = require('./src/lib/wallet');
 const { pages, payPage } = require('./src/views');
 
@@ -21,10 +22,31 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 30 }));
 
-// Session from httpOnly cookie (dashboards). API keys are handled in api-v1.
-app.use((req, res, next) => {
+// PHASE 1: session from httpOnly cookie, checked against the server-side
+// login_sessions row. A JWT whose session was revoked (logout) no longer
+// authenticates, even before its 24h expiry.
+app.use(async (req, res, next) => {
   const token = req.cookies?.paycrypto_session;
-  if (token) { const sess = verifySession(token); if (sess) { req.user = sess; } }
+  if (token) {
+    const sess = verifySession(token);
+    if (sess) {
+      try {
+        const row = await store.findSessionByTokenHash(tokenHash(token));
+        if (row) req.user = sess;
+      } catch (e) {
+        console.warn('Session check failed, treating as unauthenticated:', e.message);
+      }
+    }
+  }
+  next();
+});
+
+// PHASE 1: CSRF check for session-authenticated state changes.
+// Bearer API-key requests are exempt (not ambient credentials).
+app.use((req, res, next) => {
+  if (csrfRequired(req) && !verifyCsrf(req)) {
+    return res.status(403).json({ error: { message: 'CSRF token missing or invalid' } });
+  }
   next();
 });
 
@@ -35,6 +57,21 @@ async function initDeriver() {
     const xpub = await store.getSetting('wallet_xpub');
     if (xpub) store.setAddressDeriver((index) => deriveAddressFromXpub(xpub, index));
   } catch (e) { console.warn('HD deriver not initialized:', e.message); }
+}
+
+function assertProductionSecrets() {
+  // PHASE 1: refuse to start in production with dev fallback secrets.
+  // Previously the server would start with "dev-only-insecure-secret"
+  // if JWT_SECRET was unset — a silent, critical misconfiguration.
+  if (config.env !== 'production') return;
+  const bad = [];
+  if (!config.jwtSecret || config.jwtSecret.includes('dev-only') || config.jwtSecret.length < 32) bad.push('JWT_SECRET');
+  if (!config.sessionSecret || config.sessionSecret.includes('dev-only') || config.sessionSecret.length < 32) bad.push('SESSION_SECRET');
+  if (!/^[0-9a-fA-F]{64}$/.test(config.encryptionKey || '')) bad.push('ENCRYPTION_KEY (must be 64 hex chars)');
+  if (bad.length) {
+    console.error('Refusing to start in production with weak/missing secrets:', bad.join(', '));
+    process.exit(1);
+  }
 }
 
 app.get('/health', (req, res) => res.json({ ok: true, network: config.network, chain_id: config.chainId, payments_live: config.paymentsLive, emergency_pause: config.emergencyPause }));
@@ -63,8 +100,6 @@ app.use('/api/auth', require('./src/routes/auth')(store));
 app.use('/api/v1', require('./src/routes/api-v1')(store));
 app.use('/api/admin', require('./src/routes/admin')(store));
 
-// Cron-compatible monitor trigger (protected by header in production setups;
-// Hostinger cron should call scripts/monitor.js directly instead).
 app.post('/cron/monitor', async (req, res) => {
   if (process.env.CRON_SECRET && req.headers['x-cron-secret'] !== process.env.CRON_SECRET) return res.status(403).json({ error: { message: 'Forbidden' } });
   return res.json({ ok: true, note: 'Use scripts/monitor.js from cron for resumable scanning. This endpoint only confirms the app is up.' });
@@ -75,6 +110,7 @@ app.use((req, res) => res.status(404).json({ error: { message: 'Not found' } }))
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: { message: 'Internal error' } }); });
 
 if (require.main === module) {
+  assertProductionSecrets();
   initDeriver().finally(() => {
     app.listen(config.port, () => console.log(`PayCrypto listening on ${config.port} (${config.network}, chain ${config.chainId}, live=${config.paymentsLive})`));
   });

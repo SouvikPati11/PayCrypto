@@ -25,11 +25,13 @@ function router(store) {
     if (req.user && req.user.merchantId) { req.merchantId = req.user.merchantId; req.authType = 'session'; return next(); }
     return res.status(401).json({ error: { message: 'Authentication required' } });
   }
+  // PHASE 1: approval gates ALL merchant POSTs (invoices, withdrawals,
+  // API keys, webhooks), not just invoices. A pending merchant could
+  // previously create API keys and withdrawal requests before approval.
   function approvedOnly(req, res, next) {
     return store.findMerchantById(req.merchantId).then((m) => {
       if (!m) return res.status(404).json({ error: { message: 'Merchant not found' } });
-      if (m.status !== 'approved' && req.method === 'POST' && req.path === '/invoices') {
-        // Invoices are allowed in pending state for testnet demo? No — require approval.
+      if (m.status !== 'approved' && req.method === 'POST') {
         return res.status(403).json({ error: { message: 'Merchant is not approved yet' } });
       }
       return next();
@@ -47,7 +49,9 @@ function router(store) {
 
   r.get('/balance', async (req, res) => {
     const bal = await store.merchantBalance(req.merchantId);
-    return res.json({ merchant_id: req.merchantId, available_base_units: bal.toString(), available_usdt: formatUsdt(bal), derived_from_ledger: true });
+    const pending = await store.listWithdrawals({ merchant_id: req.merchantId, status: 'pending' });
+    const pendingBase = pending.reduce((a, w) => a + BigInt(w.amount_base_units), 0n);
+    return res.json({ merchant_id: req.merchantId, available_base_units: bal.toString(), available_usdt: formatUsdt(bal), derived_from_ledger: true, pending_withdrawal_base_units: pendingBase.toString(), pending_withdrawal_usdt: formatUsdt(pendingBase) });
   });
 
   r.post('/invoices', approvedOnly, async (req, res) => {
@@ -85,7 +89,7 @@ function router(store) {
     return res.json({ transactions: txs.map((t) => ({ ...t, amount_usdt: formatUsdt(BigInt(t.amount_base_units)) })) });
   });
 
-  r.post('/withdrawals', async (req, res) => {
+  r.post('/withdrawals', approvedOnly, async (req, res) => {
     try {
       const { destination, amount } = req.body || {};
       if (!isValidBscAddress(destination)) return res.status(400).json({ error: { message: 'Invalid BNB Smart Chain destination address' } });
@@ -111,7 +115,7 @@ function router(store) {
     return res.json({ withdrawal: w });
   });
 
-  r.post('/api-keys', async (req, res) => {
+  r.post('/api-keys', approvedOnly, async (req, res) => {
     const live = req.body?.live === true && config.paymentsLive;
     const { plaintext, hash, prefix } = generateApiKey(live);
     const key = await store.createApiKey({ merchant_id: req.merchantId, name: req.body?.name || 'Default', key_prefix: prefix, key_hash: hash, live });
@@ -120,7 +124,7 @@ function router(store) {
   r.get('/api-keys', async (req, res) => res.json({ api_keys: await store.listApiKeys(req.merchantId) }));
   r.post('/api-keys/:id/revoke', async (req, res) => { await store.revokeApiKey(req.params.id); return res.json({ ok: true }); });
 
-  r.post('/webhooks', async (req, res) => {
+  r.post('/webhooks', approvedOnly, async (req, res) => {
     const { url, events } = req.body || {};
     if (!url || !/^https:\/\//.test(url)) return res.status(400).json({ error: { message: 'Webhook URL must be https://' } });
     const secret = crypto.randomBytes(32).toString('hex');
@@ -130,17 +134,6 @@ function router(store) {
   r.get('/webhooks', async (req, res) => res.json({ webhooks: await store.listWebhooks(req.merchantId) }));
   r.get('/webhook-logs', async (req, res) => res.json({ logs: await store.listWebhookLogs(req.merchantId) }));
 
-  // Helper used by the monitor: queue a signed webhook delivery for an invoice event.
-  r._queueInvoiceWebhook = async function (merchantId, invoice, event) {
-    const hooks = await store.listWebhooks(merchantId);
-    for (const wh of hooks) {
-      // listWebhooks hides the encrypted secret; re-read is intentionally
-      // not done here in the demo path — production queueing lives in
-      // scripts/monitor.js where the full webhook row is available.
-      void wh; void signWebhook;
-    }
-    void invoice; void event;
-  };
   return r;
 }
 module.exports = router;

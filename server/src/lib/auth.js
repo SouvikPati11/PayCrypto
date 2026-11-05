@@ -9,7 +9,13 @@ async function hashPassword(password) { return bcrypt.hash(password, 12); }
 async function verifyPassword(password, hash) { return bcrypt.compare(password, hash); }
 
 function signSession(user) {
-  return jwt.sign({ sub: user.id, role: user.role, merchantId: user.merchant_id || null }, config.jwtSecret, { expiresIn: '24h' });
+  // jti links the JWT to a login_sessions row so logout can revoke it
+  // (PHASE 1). A bare JWT with no server-side record could not be revoked.
+  const jti = crypto.randomBytes(16).toString('hex');
+  return jwt.sign({ sub: user.id, role: user.role, merchantId: user.merchant_id || null, jti }, config.jwtSecret, { expiresIn: '24h' });
+}
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 function verifySession(token) {
   try { return jwt.verify(token, config.jwtSecret); } catch { return null; }
@@ -47,4 +53,4 @@ function can(role, permission) {
   return perms.includes('*') || perms.includes(permission);
 }
 
-module.exports = { hashPassword, verifyPassword, signSession, verifySession, generateApiKey, hashApiKey, newTotpSecret, totpToken, verifyTotp, totpAuthUrl, ADMIN_PERMISSIONS, can };
+module.exports = { hashPassword, verifyPassword, signSession, verifySession, tokenHash, generateApiKey, hashApiKey, newTotpSecret, totpToken, verifyTotp, totpAuthUrl, ADMIN_PERMISSIONS, can };

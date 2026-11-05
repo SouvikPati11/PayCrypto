@@ -13,12 +13,47 @@
 //  - On RPC failure the checkpoint is NOT advanced, so the next run retries
 //    the same range. This function is pure over a `provider`-like object in
 //    tests and uses ethers in production (scripts/monitor.js).
+// PHASE 1 changes:
+//  - Expired invoices NEVER credit, even if payment arrives late. A late
+//    payment is recorded for audit but does not move the ledger, and the
+//    invoice is moved to expired. Previously a late confirmed payment
+//    could mark an expired invoice paid.
+//  - expirePendingInvoices() moves past-expiry pending invoices to expired
+//    (called by scripts/monitor.js each run).
+//  - reconcileOrphaned() marks confirming transfers that vanished from a
+//    re-scanned range as orphaned, instead of leaving them confirming
+//    forever.
 const { parseTransferLog, isCanonicalTokenContract } = require('./blockchain');
 const { classifyInvoice } = require('./ledger');
 const { formatUsdt } = require('./money');
 
+async function expirePendingInvoices(store, now = new Date()) {
+  const invoices = await store.listInvoices({});
+  let expired = 0;
+  for (const inv of invoices) {
+    if (inv.status === 'pending' && inv.expires_at && new Date(inv.expires_at).getTime() < now.getTime()) {
+      await store.updateInvoice(inv.id, { status: 'expired' });
+      expired++;
+    }
+  }
+  return expired;
+}
+
+async function reconcileOrphaned(store, { scannedKeys, fromBlock, toBlock }) {
+  // scannedKeys: Set of "txHash:logIndex" seen in this scan range.
+  const txs = await store.listTxs({ status: 'confirming' });
+  let orphaned = 0;
+  for (const tx of txs) {
+    const inRange = Number(tx.block_number) >= fromBlock && Number(tx.block_number) <= toBlock;
+    if (inRange && !scannedKeys.has(`${tx.tx_hash}:${tx.log_index}`)) {
+      await store.updateTx(tx.id, { status: 'orphaned' });
+      orphaned++;
+    }
+  }
+  return orphaned;
+}
+
 async function processTransfer(store, transfer, { tokenContract, confirmations, currentBlock, invoice }) {
-  // transfer: {from,to,value,txHash,logIndex,blockNumber,blockHash,receiptStatus}
   if (!isCanonicalTokenContract(transfer.tokenContract || tokenContract, tokenContract)) {
     return { ignored: true, reason: 'token contract mismatch' };
   }
@@ -34,8 +69,15 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
     invoice_id: inv?.id || null, merchant_id: addressRow.merchant_id, status, confirmations: conf,
   });
   if (duplicate) {
-    // Still update confirmations/status on the existing row (idempotent).
     await store.updateTx(tx.id, { confirmations: conf, status });
+  }
+  // PHASE 1: expired invoices never credit, on first sight or on repeat.
+  const isExpired = inv && inv.expires_at && new Date(inv.expires_at).getTime() < Date.now();
+  if (isExpired && inv.status !== 'expired') {
+    await store.updateInvoice(inv.id, { status: 'expired' });
+  }
+  if (isExpired) {
+    return { ignored: true, credited: false, reason: 'invoice expired — payment recorded, not credited', txId: tx.id, status };
   }
   let credited = false;
   if (status === 'confirmed' && inv && inv.status !== 'paid' && inv.status !== 'cancelled') {
@@ -47,9 +89,8 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
       });
       credited = true;
     } catch (e) {
-      if (e.code !== 'DUPLICATE') throw e; // duplicate credit prevented
+      if (e.code !== 'DUPLICATE') throw e;
     }
-    // Recompute invoice status from ALL confirmed credits for that invoice.
     const all = await store.listTxs({ merchant_id: inv.merchant_id });
     const confirmedSum = all.filter((t) => t.invoice_id === inv.id && t.status === 'confirmed').reduce((a, t) => a + BigInt(t.amount_base_units), 0n);
     const confirmingSum = all.filter((t) => t.invoice_id === inv.id && t.status === 'confirming').reduce((a, t) => a + BigInt(t.amount_base_units), 0n);
@@ -60,4 +101,4 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
   return { ignored: false, duplicate, credited, txId: tx.id, status };
 }
 
-module.exports = { processTransfer };
+module.exports = { processTransfer, expirePendingInvoices, reconcileOrphaned };

@@ -29,13 +29,19 @@ function classifyInvoice({ expected, receivedConfirmed = 0n, receivedConfirming 
 }
 
 function validateWithdrawal({ availableBaseUnits, amountUsdt, feeUsdt, minUsdt, maxUsdt }) {
+  // PHASE 1 FIX (accounting): amount is the GROSS withdrawal. The fee is
+  // taken FROM it (net = amount - fee), not charged ON TOP of it. The old
+  // code required amount+fee <= balance but debited only amount on
+  // confirmation, leaving the fee unaccounted for. Now debit(amount) on
+  // confirmation is exactly the balance movement, and net is what is sent.
   const amount = parseUsdt(amountUsdt);
   const fee = parseUsdt(feeUsdt);
   const min = parseUsdt(minUsdt);
   const max = parseUsdt(maxUsdt);
   if (amount < min) return { ok: false, error: `Amount below minimum withdrawal (${minUsdt} USDT)` };
   if (amount > max) return { ok: false, error: `Amount above maximum withdrawal (${maxUsdt} USDT)` };
-  if (amount + fee > BigInt(availableBaseUnits)) return { ok: false, error: 'Insufficient available balance (including fee)' };
+  if (amount <= fee) return { ok: false, error: 'Withdrawal amount must exceed the fee' };
+  if (amount > BigInt(availableBaseUnits)) return { ok: false, error: 'Insufficient available balance' };
   return { ok: true, amount, fee, net: amount - fee };
 }
 
