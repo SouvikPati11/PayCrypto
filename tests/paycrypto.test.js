@@ -421,3 +421,86 @@ test('phase4: ledger crediting + withdrawal approval flow without real funds', a
   await store.addLedgerEntry({ merchant_id: merchant.id, withdrawal_id: w.id, entry_type: 'debit', amount_base_units: parseUsdt('10').toString(), description: 'Withdrawal confirmed', reference_key: `withdrawal:${w.id}` });
   assert.equal(await store.merchantBalance(merchant.id), 0n);
 });
+
+// ---- PHASE 5 tests (signer service, mocks + test-only keys only) ----
+const { hmacSign, verifySignerRequest, validateSignRequest, verifyReceipt, signJob, buildUsdtTransfer } = require('../services/signer/core');
+const { ethers } = require('ethers');
+
+const P5_MNEMONIC = TEST_MNEMONIC;
+const P5_TREASURY = '0x2222222222222222222222222222222222222222';
+const P5_CONTRACT = '0x3333333333333333333333333333333333333333';
+const P5_CFG = { network: 'testnet', chainId: 97, usdtContract: P5_CONTRACT.toLowerCase(), treasuryAddress: P5_TREASURY.toLowerCase(), dryRun: true, maxGasPriceGwei: 5, maxTxUsdt: '10000', dailyLimitUsdt: '100', minSweepUsdt: '10', confirmations: 12 };
+function p5State() { return { dailyTotals: {}, broadcasts: {} }; }
+function p5Audit() { const logs = []; return { logs, fn: (e) => logs.push(e) }; }
+// Mock provider: gas 3 gwei, estimate 60000, 1 BNB, 100 USDT, nonce 0, broadcast returns a receipt.
+function p5Provider({ bnb = 1000000000000000000n, usdt = parseUsdt('100'), gasPrice = 3000000000n } = {}) {
+  const coder = new ethers.AbiCoder();
+  return {
+    getFeeData: async () => ({ gasPrice }),
+    estimateGas: async () => 60000n,
+    getBalance: async () => bnb,
+    getTransactionCount: async () => 0,
+    call: async () => coder.encode(['uint256'], [usdt]),
+    broadcastTransaction: async (signed) => ({ hash: ethers.keccak256(signed), wait: async () => ({ status: 1, to: P5_CONTRACT, logs: [] }) }),
+  };
+}
+function p5DepositWallet(index = 0) { return ethers.HDNodeWallet.fromPhrase(P5_MNEMONIC, undefined, `m/44'/60'/0'/0/${index}`); }
+function p5TreasuryWallet() { return new ethers.Wallet('0x' + '11'.repeat(32)); }
+
+test('phase5: signer HMAC auth — valid passes, tampered fails, old timestamp fails, nonce reuse fails', () => {
+  const secret = 'a'.repeat(32);
+  const body = JSON.stringify({ job_id: 'x' });
+  const sig = hmacSign(secret, 'POST', '/sign', '1700000000000', 'nonce-1', body);
+  const seen = new Map();
+  assert.equal(verifySignerRequest({ method: 'POST', path: '/sign', timestamp: '1700000000000', nonce: 'nonce-1', body, signature: sig, secret, seenNonces: seen, nowMs: 1700000000000 }).ok, true);
+  assert.equal(verifySignerRequest({ method: 'POST', path: '/sign', timestamp: '1700000000000', nonce: 'nonce-1', body, signature: sig, secret, seenNonces: seen, nowMs: 1700000000000 }).ok, false); // replay
+  assert.equal(verifySignerRequest({ method: 'POST', path: '/sign', timestamp: '1700000000000', nonce: 'nonce-2', body, signature: '00'.repeat(32), secret, seenNonces: seen, nowMs: 1700000000000 }).ok, false);
+  assert.equal(verifySignerRequest({ method: 'POST', path: '/sign', timestamp: '1700000000000', nonce: 'nonce-3', body, signature: sig, secret, seenNonces: seen, nowMs: 1700000000000 + 600_000 }).ok, false); // stale
+});
+
+test('phase5: sweep destination must be treasury; withdrawal must have approval and must not target treasury', () => {
+  const sweepOk = validateSignRequest({ job_id: 'sweep:1', kind: 'sweep', deposit_index: 0, to: P5_TREASURY, amount_base_units: parseUsdt('10').toString() }, P5_CFG);
+  assert.equal(sweepOk.kind, 'sweep');
+  assert.throws(() => validateSignRequest({ job_id: 'sweep:1', kind: 'sweep', deposit_index: 0, to: '0x4444444444444444444444444444444444444444', amount_base_units: parseUsdt('10').toString() }, P5_CFG), /treasury/);
+  assert.throws(() => validateSignRequest({ job_id: 'wd:1', kind: 'withdrawal', withdrawal_id: 1, to: P5_TREASURY, amount_base_units: parseUsdt('10').toString(), approved_by: 'admin' }, P5_CFG), /treasury/);
+  assert.throws(() => validateSignRequest({ job_id: 'wd:1', kind: 'withdrawal', withdrawal_id: 1, to: '0x4444444444444444444444444444444444444444', amount_base_units: parseUsdt('10').toString() }, P5_CFG), /approved_by/);
+  assert.throws(() => validateSignRequest({ job_id: 'wd:1', kind: 'withdrawal', withdrawal_id: 1, to: '0x4444444444444444444444444444444444444444', amount_base_units: parseUsdt('20000').toString(), approved_by: 'admin' }, { ...P5_CFG, maxTxUsdt: '10000' }), /limit/);
+});
+
+test('phase5: gas management — insufficient BNB fails, gas price over cap fails', async () => {
+  const wallet = p5DepositWallet(0);
+  await assert.rejects(() => buildUsdtTransfer({ wallet, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString(), cfg: P5_CFG, provider: p5Provider({ bnb: 1n }) }), /Insufficient BNB/);
+  await assert.rejects(() => buildUsdtTransfer({ wallet, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString(), cfg: P5_CFG, provider: p5Provider({ gasPrice: 10000000000n }) }), /Gas price/);
+  await assert.rejects(() => buildUsdtTransfer({ wallet, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString(), cfg: P5_CFG, provider: p5Provider({ usdt: parseUsdt('5') }) }), /Insufficient USDT/);
+  const ok = await buildUsdtTransfer({ wallet, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString(), cfg: P5_CFG, provider: p5Provider() });
+  assert.equal(ok.tx.chainId, 97); assert.equal(ok.tx.to, P5_CONTRACT.toLowerCase());
+});
+
+test('phase5: signJob dry-run signs without broadcasting, duplicate job returns existing result, daily limit enforced', async () => {
+  const state = p5State(); const { logs, fn } = p5Audit();
+  const wallet = p5DepositWallet(0);
+  const r1 = await signJob({ req: { job_id: 'sweep:test-1', kind: 'sweep', deposit_index: 0, to: P5_TREASURY, amount_base_units: parseUsdt('10').toString() }, wallet, cfg: P5_CFG, provider: p5Provider(), state, audit: fn });
+  assert.equal(r1.broadcast, false); assert.equal(r1.dry_run, true); assert.ok(/^0x[0-9a-f]{64}$/.test(r1.tx_hash));
+  const r2 = await signJob({ req: { job_id: 'sweep:test-1', kind: 'sweep', deposit_index: 0, to: P5_TREASURY, amount_base_units: parseUsdt('10').toString() }, wallet, cfg: P5_CFG, provider: p5Provider(), state, audit: fn });
+  assert.equal(r2.duplicate, true); assert.equal(r2.tx_hash, r1.tx_hash);
+  assert.ok(logs.some((l) => l.event === 'sign.dry_run'));
+  // Daily limit: 100 USDT/day, 10 already dry-run does NOT consume limit, but a broadcast would. Simulate a broadcast day total of 95, then a 10 broadcast must fail.
+  const state2 = p5State(); state2.dailyTotals[new Date().toISOString().slice(0, 10)] = parseUsdt('95').toString();
+  const cfgLive = { ...P5_CFG, dryRun: false };
+  await assert.rejects(() => signJob({ req: { job_id: 'wd:limit', kind: 'withdrawal', withdrawal_id: 1, approved_by: 'admin', to: '0x4444444444444444444444444444444444444444', amount_base_units: parseUsdt('10').toString() }, wallet: p5TreasuryWallet(), cfg: cfgLive, provider: p5Provider(), state: state2, audit: fn }), /Daily limit/);
+});
+
+test('phase5: signJob live broadcast verifies receipt and records daily total', async () => {
+  const state = p5State(); const { fn } = p5Audit();
+  const cfgLive = { ...P5_CFG, dryRun: false };
+  const r = await signJob({ req: { job_id: 'wd:live-1', kind: 'withdrawal', withdrawal_id: 1, approved_by: 'admin', to: '0x4444444444444444444444444444444444444444', amount_base_units: parseUsdt('10').toString() }, wallet: p5TreasuryWallet(), cfg: cfgLive, provider: p5Provider(), state, audit: fn });
+  assert.equal(r.broadcast, true); assert.equal(r.receipt_status, 1);
+  assert.equal(BigInt(state.dailyTotals[new Date().toISOString().slice(0, 10)]), parseUsdt('10'));
+});
+
+test('phase5: receipt verification rejects failed tx and wrong contract', () => {
+  assert.equal(verifyReceipt({ status: 1, to: P5_CONTRACT, logs: [] }, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), true);
+  assert.throws(() => verifyReceipt({ status: 0, to: P5_CONTRACT, logs: [] }, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), /failed/);
+  assert.throws(() => verifyReceipt({ status: 1, to: '0x5555555555555555555555555555555555555555', logs: [] }, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), /contract mismatch/);
+  assert.throws(() => verifyReceipt(null, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), /No receipt/);
+});

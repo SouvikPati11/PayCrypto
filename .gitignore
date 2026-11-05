@@ -12,3 +12,10 @@ dist/
 .DS_Store
 *.log
 coverage/
+
+# Signer service (Phase 5) — never commit signer state, audit logs or env files
+services/signer/state.json
+signer-state.json
+signer-audit.log
+*.signer.env
+config/signer-vault.enc.json
