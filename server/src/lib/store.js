@@ -51,6 +51,7 @@ class MemoryStore {
     this.nextId = 1; this.nextIndex = 0; this.deriver = null;
   }
   setAddressDeriver(fn) { this.deriver = fn; }
+  async ping() { return true; }
   _id() { return this.nextId++; }
   async getSetting(k) { return this.settings.get(k); }
   async getAllSettings() { return Object.fromEntries(this.settings); }
@@ -169,6 +170,7 @@ class MemoryStore {
 
 class MysqlStore {
   setAddressDeriver(fn) { this.deriver = fn; }
+  async ping() { await this.q('SELECT 1 AS ok'); return true; }
   async q(sql, params = []) { const [rows] = await pool().query(sql, params); return rows; }
   async getSetting(k) { const r = await this.q('SELECT `value` FROM system_settings WHERE `key`=?', [k]); return r[0]?.value ?? null; }
   async getAllSettings() { const r = await this.q('SELECT `key`,`value` FROM system_settings'); return Object.fromEntries(r.map((x) => [x.key, x.value])); }
@@ -267,6 +269,13 @@ class MysqlStore {
 }
 
 function createStore() {
+  // HOSTINGER FIX (requirement 8): never silently switch to in-memory
+  // storage in production. MEMORY_DB=true in production is a
+  // configuration error, not a fallback — fail loudly at startup
+  // instead of losing merchant data on restart.
+  if (config.env === 'production' && config.memoryDb) {
+    throw new Error('MEMORY_DB must not be used in production: production requires MySQL');
+  }
   if (config.memoryDb) return new MemoryStore();
   return new MysqlStore();
 }

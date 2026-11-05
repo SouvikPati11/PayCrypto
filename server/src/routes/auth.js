@@ -4,6 +4,7 @@ const { hashPassword, verifyPassword, signSession, verifyTotp, newTotpSecret, to
 const { generateCsrfToken } = require('../lib/csrf');
 const { encryptSecret } = require('../lib/wallet');
 const config = require('../lib/config');
+const { isDbError } = require('../lib/db-error');
 
 function router(store) {
   const r = express.Router();
@@ -20,7 +21,7 @@ function router(store) {
       await store.updateUser(user.id, { merchant_id: merchant.id });
       await store.logAudit({ actor_type: 'merchant', actor_id: user.id, action: 'merchant.registered', entity_type: 'merchant', entity_id: merchant.id, ip_address: req.ip });
       return res.status(201).json({ user: { id: user.id, email, role: 'merchant' }, merchant: { id: merchant.id, status: 'pending' } });
-    } catch (e) { return res.status(e.code === 'DUPLICATE' ? 409 : 500).json({ error: { message: e.message } }); }
+    } catch (e) { return res.status(e.code === 'DUPLICATE' ? 409 : isDbError(e) ? 503 : 500).json({ error: { message: isDbError(e) ? 'Database unavailable' : e.message } }); }
   });
 
   r.post('/login', async (req, res) => {
@@ -43,7 +44,7 @@ function router(store) {
       res.cookie('paycrypto_session', token, cookieOpts);
       res.cookie('paycrypto_csrf', csrf, { sameSite: 'lax', secure: config.env === 'production', maxAge: 24 * 3600 * 1000, path: '/' });
       return res.json({ user: { id: user.id, email: user.email, role: user.role, merchant_id: user.merchant_id }, csrf_token: csrf });
-    } catch (e) { return res.status(500).json({ error: { message: e.message } }); }
+    } catch (e) { return res.status(isDbError(e) ? 503 : 500).json({ error: { message: isDbError(e) ? 'Database unavailable' : e.message } }); }
   });
 
   r.post('/logout', async (req, res) => {

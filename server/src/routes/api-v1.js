@@ -10,6 +10,7 @@ const { isValidBscAddress, encryptSecret } = require('../lib/wallet');
 const { generateApiKey, hashApiKey } = require('../lib/auth');
 const { signWebhook } = require('../lib/webhooks');
 const config = require('../lib/config');
+const { isDbError } = require('../lib/db-error');
 const { createPerKeyLimiter } = require('../lib/rate-limit');
 
 function router(store) {
@@ -76,7 +77,7 @@ function router(store) {
       const updated = await store.updateInvoice(invoice.id, { deposit_address: addr.address, deposit_address_id: addr.id });
       await store.logAudit({ actor_type: 'merchant', actor_id: req.user?.sub || null, action: 'invoice.created', entity_type: 'invoice', entity_id: invoice.id });
       return res.status(201).json({ invoice: presentInvoice(updated) });
-    } catch (e) { return res.status(e.code === 'DUPLICATE' ? 409 : 500).json({ error: { message: e.message } }); }
+    } catch (e) { return res.status(e.code === 'DUPLICATE' ? 409 : isDbError(e) ? 503 : 500).json({ error: { message: isDbError(e) ? 'Database unavailable' : e.message } }); }
   });
 
   r.get('/invoices', async (req, res) => {
@@ -107,7 +108,7 @@ function router(store) {
       });
       await store.logAudit({ actor_type: 'merchant', actor_id: req.user?.sub || null, action: 'withdrawal.requested', entity_type: 'withdrawal', entity_id: w.id });
       return res.status(201).json({ withdrawal: w, note: 'Pending admin approval. No funds move until approved, and no automatic broadcast happens unless WITHDRAWAL_AUTO_BROADCAST is enabled with a signing service.' });
-    } catch (e) { return res.status(500).json({ error: { message: e.message } }); }
+    } catch (e) { return res.status(isDbError(e) ? 503 : 500).json({ error: { message: isDbError(e) ? 'Database unavailable' : e.message } }); }
   });
   r.get('/withdrawals', async (req, res) => {
     const list = await store.listWithdrawals({ merchant_id: req.merchantId, status: req.query.status || null });

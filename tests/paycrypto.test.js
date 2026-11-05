@@ -504,3 +504,110 @@ test('phase5: receipt verification rejects failed tx and wrong contract', () => 
   assert.throws(() => verifyReceipt({ status: 1, to: '0x5555555555555555555555555555555555555555', logs: [] }, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), /contract mismatch/);
   assert.throws(() => verifyReceipt(null, { contract: P5_CONTRACT, to: P5_TREASURY, amountBaseUnits: parseUsdt('10').toString() }), /No receipt/);
 });
+
+// ---- HOSTINGER STARTUP tests (listen first, DB/deriver after) ----
+const { isDbError } = require('../server/src/lib/db-error');
+
+test('hostinger: DB errors map to 503, non-DB errors do not', () => {
+  assert.equal(isDbError({ code: 'ECONNREFUSED' }), true);
+  assert.equal(isDbError({ code: 'ER_ACCESS_DENIED_ERROR' }), true);
+  assert.equal(isDbError({ code: 'ER_DUP_ENTRY' }), true);
+  assert.equal(isDbError(new Error('some other failure')), false);
+  assert.equal(isDbError(null), false);
+});
+
+test('hostinger: production + MEMORY_DB refuses to create a store (no silent memory fallback)', async () => {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', "require('./server/src/lib/store').createStore(); console.log('STORE_OK')"], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, NODE_ENV: 'production', MEMORY_DB: 'true', ENCRYPTION_KEY: 'a'.repeat(64) },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const code = await new Promise((res) => child.on('close', res));
+  assert.notEqual(code, 0);
+  assert.match(out, /MEMORY_DB must not be used in production/);
+  assert.doesNotMatch(out, /STORE_OK/);
+});
+
+test('hostinger: app listens and /health + /ready are honest with a memory store', async () => {
+  const { app, checkReadiness } = require('../server/index');
+  const server = await new Promise((res) => { const s = app.listen(0, '127.0.0.1', () => res(s)); });
+  try {
+    const port = server.address().port;
+    await checkReadiness();
+    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(health.ok, true);
+    assert.equal(health.db_ready, true);
+    assert.equal(health.db, 'ready');
+    // deriver is not_configured in a fresh memory store (no wallet_xpub) — honest, not falsely 'ready'.
+    assert.equal(health.deriver, 'not_configured');
+    const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
+    assert.equal(readyRes.status, 200);
+  } finally { await new Promise((res) => server.close(res)); }
+});
+
+async function hostingerSpawnServer(port, dbPort) {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, PORT: String(port), NODE_ENV: 'development', MEMORY_DB: '', ENCRYPTION_KEY: 'a'.repeat(64), DB_HOST: '127.0.0.1', DB_PORT: String(dbPort), DB_USER: 'test', DB_PASSWORD: 'secret-password-must-not-leak', DB_NAME: 'paycrypto' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log = '';
+  child.stdout.on('data', (d) => { log += d; });
+  child.stderr.on('data', (d) => { log += d; });
+  return { child, getLog: () => log };
+}
+async function waitForHealth(port, timeoutMs = 3000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/health`);
+      if (r.ok) return { elapsedMs: Date.now() - start, body: await r.json() };
+    } catch {}
+    await new Promise((res) => setTimeout(res, 100));
+  }
+  throw new Error('Server did not answer /health within ' + timeoutMs + 'ms');
+}
+
+test('hostinger: server listens within 3s with MySQL down (closed port), /health degraded, /ready 503, /api 503, no credentials leaked', async () => {
+  const port = 32100 + Math.floor(Math.random() * 100);
+  const { child, getLog } = await hostingerSpawnServer(port, 59999);
+  try {
+    const { elapsedMs, body } = await waitForHealth(port, 3000);
+    assert.ok(elapsedMs < 3000, `listened in ${elapsedMs}ms, must be <3000ms`);
+    assert.equal(body.ok, true);
+    assert.equal(body.db_ready, false);
+    assert.equal(body.db, 'unavailable');
+    assert.equal(body.last_error, 'ECONNREFUSED');
+    assert.doesNotMatch(JSON.stringify(body), /secret-password-must-not-leak/);
+    assert.doesNotMatch(getLog(), /secret-password-must-not-leak/);
+    const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
+    assert.equal(readyRes.status, 503);
+    const loginRes = await fetch(`http://127.0.0.1:${port}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'a@b.com', password: 'long-password-123' }) });
+    assert.equal(loginRes.status, 503);
+    const loginBody = await loginRes.json();
+    assert.equal(loginBody.error.message, 'Database unavailable');
+  } finally { child.kill('SIGTERM'); }
+});
+
+test('hostinger: server listens within 3s with MySQL hanging (dummy TCP, never responds), /health honest unknown, /ready 503', async () => {
+  const net = require('node:net');
+  const dummyPort = 32200 + Math.floor(Math.random() * 100);
+  const dummy = net.createServer((socket) => { socket.on('error', () => {}); /* never respond, like a hung MySQL handshake */ });
+  await new Promise((res) => dummy.listen(dummyPort, '127.0.0.1', res));
+  const port = 32300 + Math.floor(Math.random() * 100);
+  const { child } = await hostingerSpawnServer(port, dummyPort);
+  try {
+    const { elapsedMs, body } = await waitForHealth(port, 3000);
+    assert.ok(elapsedMs < 3000, `listened in ${elapsedMs}ms, must be <3000ms`);
+    // Deriver is still hanging on the DB handshake in the background:
+    // /health must NOT claim the DB is ready.
+    assert.equal(body.db_ready, false);
+    assert.ok(body.db === 'unknown' || body.db === 'unavailable');
+    const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
+    assert.equal(readyRes.status, 503);
+  } finally { child.kill('SIGTERM'); await new Promise((res) => dummy.close(res)); }
+});
