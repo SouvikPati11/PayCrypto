@@ -218,3 +218,60 @@ test('phase1: session revocation + SQL column allowlist', async () => {
   const { invoice } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-ALLOW', amount_base_units: parseUsdt('1').toString(), expires_at: new Date(Date.now() + 3600_000).toISOString() });
   await assert.rejects(() => store.updateInvoice(invoice.id, { amount_base_units: '999' }), /unknown field/);
 });
+
+// ---- PHASE 2 tests ----
+const { createPerKeyLimiter } = require('../server/src/lib/rate-limit');
+const { toMysqlDatetime } = require('../server/src/lib/dates');
+const { deliverOne } = require('../server/src/lib/webhook-delivery');
+
+test('phase2: per-key rate limiter allows up to max, then 429s, per key', () => {
+  const limiter = createPerKeyLimiter({ windowMs: 60_000, max: 2 });
+  const req = (merchantId) => ({ merchantId, ip: '127.0.0.1' });
+  const res = () => { const r = { statusCode: null, body: null, status(c) { r.statusCode = c; return r; }, json(b) { r.body = b; return r; }, set() {} }; return r; };
+  let nextCalls = 0; const next = () => { nextCalls++; };
+  const r1 = res(); limiter(req(1), r1, next);
+  const r2 = res(); limiter(req(1), r2, next);
+  const r3 = res(); limiter(req(1), r3, next);
+  assert.equal(nextCalls, 2); assert.equal(r3.statusCode, 429);
+  // A different merchant is not blocked by the first merchant's usage.
+  const r4 = res(); limiter(req(2), r4, next);
+  assert.equal(nextCalls, 3);
+});
+
+test('phase2: MySQL datetime conversion', () => {
+  assert.equal(toMysqlDatetime('2026-11-05T07:00:00.000Z'), '2026-11-05 07:00:00');
+  assert.equal(toMysqlDatetime('2026-11-05 07:00:00'), '2026-11-05 07:00:00');
+  assert.equal(toMysqlDatetime(null), null);
+});
+
+test('phase2: webhook delivery marks sent on 2xx, retries on failure, fails after 5', async () => {
+  const store = new MemoryStore();
+  store.setAddressDeriver((i) => deriveAddressFromMnemonic(TEST_MNEMONIC, i));
+  const log = await store.queueWebhookLog({ webhook_id: 1, merchant_id: 1, event: 'invoice.paid', payload: { event: 'invoice.paid' }, signature: 'sha256=x', url: undefined });
+  // Success path
+  const ok = await deliverOne(store, { ...log, url: 'https://example.com/hook' }, async () => ({ status: 200 }));
+  assert.equal(ok.delivered, true);
+  const afterOk = store.webhookLogs.find((x) => x.id === log.id);
+  assert.equal(afterOk.status, 'sent'); assert.equal(afterOk.attempts, 1);
+  // Failure path, then final failure at attempt 5
+  const log2 = await store.queueWebhookLog({ webhook_id: 1, merchant_id: 1, event: 'invoice.paid', payload: {}, signature: 'sha256=y' });
+  const fail = await deliverOne(store, { ...log2, url: 'https://example.com/hook' }, async () => { throw new Error('network down'); });
+  assert.equal(fail.delivered, false);
+  const afterFail = store.webhookLogs.find((x) => x.id === log2.id);
+  assert.equal(afterFail.status, 'pending'); assert.equal(afterFail.attempts, 1); assert.ok(afterFail.next_retry_at);
+  const log3 = await store.queueWebhookLog({ webhook_id: 1, merchant_id: 1, event: 'invoice.paid', payload: {}, signature: 'sha256=z' });
+  store.webhookLogs.find((x) => x.id === log3.id).attempts = 4;
+  const finalFail = await deliverOne(store, { ...store.webhookLogs.find((x) => x.id === log3.id), url: 'https://example.com/hook' }, async () => ({ status: 500 }));
+  assert.equal(finalFail.failed, true);
+  assert.equal(store.webhookLogs.find((x) => x.id === log3.id).status, 'failed');
+});
+
+test('phase2: due webhook logs only include pending, under-5-attempt, due logs', async () => {
+  const store = new MemoryStore();
+  const due = await store.queueWebhookLog({ webhook_id: 1, merchant_id: 1, event: 'invoice.paid', payload: {}, signature: 's' });
+  const notDue = await store.queueWebhookLog({ webhook_id: 1, merchant_id: 1, event: 'invoice.paid', payload: {}, signature: 's' });
+  store.webhookLogs.find((x) => x.id === notDue.id).next_retry_at = new Date(Date.now() + 3600_000).toISOString();
+  const dueList = await store.listDueWebhookLogs();
+  assert.ok(dueList.some((x) => x.id === due.id));
+  assert.ok(!dueList.some((x) => x.id === notDue.id));
+});

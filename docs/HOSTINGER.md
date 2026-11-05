@@ -79,6 +79,17 @@ range and the new checkpoint. On RPC failure the checkpoint is **not**
 advanced, so the next run retries the same range — do not manually
 advance the checkpoint.
 
+Webhook delivery cron (also required, every minute):
+
+```
+* * * * * cd ~/paycrypto && /usr/bin/node scripts/deliver-webhooks.js >> logs/webhooks.log 2>&1
+```
+
+CSP note (Phase 2): all page JavaScript now lives in external
+`/js/*.js` files and the server sends a strict CSP
+(`script-src 'self'`, `frame-ancestors 'none'`). Do not add inline
+scripts to dashboard pages without updating the CSP.
+
 ## 8. Troubleshooting
 
 - App won't start: check Node version (>=20), `npm install` output,

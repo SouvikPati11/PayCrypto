@@ -40,13 +40,19 @@ Structured: `{error:{message}}` with HTTP status (400 validation,
 - Header: `X-PayCrypto-Signature: sha256=<hmac-sha256(secret, raw-body)>`
 - Verify with a timing-safe compare. Retry schedule (queued by the
   monitor): 1m, 5m, 15m, 1h, 6h, max 5 attempts.
-- Production delivery worker pattern: a cron job every minute that
-  POSTs `pending` logs whose `next_retry_at` has passed, updates
-  `webhook_logs` with the response code, and marks `sent`/`failed`
-  after the final attempt. The monitor only queues; it does not
-  block scanning on a slow merchant endpoint.
+- Production delivery worker (implemented, Phase 2):
+  `scripts/deliver-webhooks.js`, cron every minute (see
+  docs/DEPLOYMENT_CHECKLIST.md). It POSTs `pending` logs whose
+  `next_retry_at` has passed, updates `webhook_logs` with the
+  response code, and marks `sent`/`failed` after the final
+  (5th) attempt. The monitor only queues; it does not block
+  scanning on a slow merchant endpoint. Webhook log listings
+  via the API strip the HMAC signature (Phase 2).
 
 ## Rate limits
 
-600 requests / 15 min per IP on `/api/*`, 30 / 15 min on login.
-Tighten per-API-key limits in production if needed.
+600 requests / 15 min per IP on `/api/*`, 30 / 15 min on login,
+**plus** 600 requests / 15 min per merchant/API key on
+authenticated `/api/v1/*` routes (Phase 2, in-memory per-process
+store — see the limitation note in `server/src/lib/rate-limit.js`
+for multi-process deployments).

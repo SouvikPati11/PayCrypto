@@ -10,6 +10,7 @@ const { isValidBscAddress, encryptSecret } = require('../lib/wallet');
 const { generateApiKey, hashApiKey } = require('../lib/auth');
 const { signWebhook } = require('../lib/webhooks');
 const config = require('../lib/config');
+const { createPerKeyLimiter } = require('../lib/rate-limit');
 
 function router(store) {
   const r = express.Router();
@@ -46,6 +47,9 @@ function router(store) {
   });
 
   r.use(merchantAuth);
+  // PHASE 2: per-merchant/API-key limiter, in addition to the IP limiter
+  // in server/index.js. 600 requests / 15 min per merchant.
+  r.use(createPerKeyLimiter({ windowMs: 15 * 60 * 1000, max: 600 }));
 
   r.get('/balance', async (req, res) => {
     const bal = await store.merchantBalance(req.merchantId);
@@ -132,7 +136,13 @@ function router(store) {
     return res.status(201).json({ webhook: { id: wh.id, url: wh.url, events: wh.events }, secret, warning: 'Store this webhook secret — it is used to verify HMAC signatures.' });
   });
   r.get('/webhooks', async (req, res) => res.json({ webhooks: await store.listWebhooks(req.merchantId) }));
-  r.get('/webhook-logs', async (req, res) => res.json({ logs: await store.listWebhookLogs(req.merchantId) }));
+  // PHASE 2: webhook logs must not leak HMAC signatures to API callers.
+  // The signature is not the secret, but it is not needed by the caller
+  // and must not be replayable from a log listing.
+  r.get('/webhook-logs', async (req, res) => {
+    const logs = await store.listWebhookLogs(req.merchantId);
+    return res.json({ logs: logs.map(({ signature, ...rest }) => rest) });
+  });
 
   return r;
 }

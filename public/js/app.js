@@ -16,10 +16,16 @@ async function api(path, opts = {}) {
   return data;
 }
 function el(id) { return document.getElementById(id); }
-function renderTable(target, rows, cols) {
+// PHASE 2: renderTable escapes every cell by default. Only columns listed
+// in options.raw are inserted as HTML, and callers may use raw ONLY for
+// HTML they generate themselves from ids/enums — never for user text.
+// This fixes the Phase 1 regression where admin Approve/Suspend buttons
+// (generated HTML) were escaped into visible text.
+function renderTable(target, rows, cols, options = {}) {
+  const raw = new Set(options.raw || []);
   const t = el(target); if (!t) return;
   if (!rows.length) { t.innerHTML = '<p class="muted">No records yet.</p>'; return; }
-  t.innerHTML = '<table><tr>' + cols.map((c) => `<th>${c}</th>`).join('') + '</tr>' +
-    rows.map((r) => '<tr>' + cols.map((c) => `<td>${escapeHtml(r[c])}</td>`).join('') + '</tr>').join('') + '</table>';
+  t.innerHTML = '<table><tr>' + cols.map((c) => `<th>${escapeHtml(c)}</th>`).join('') + '</tr>' +
+    rows.map((r) => '<tr>' + cols.map((c) => `<td>${raw.has(c) ? (r[c] ?? '') : escapeHtml(r[c])}</td>`).join('') + '</tr>').join('') + '</table>';
 }
-window.PayCrypto = { api, renderTable };
+window.PayCrypto = { api, renderTable, escapeHtml };

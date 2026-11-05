@@ -15,7 +15,13 @@ const { pages, payPage } = require('./src/views');
 
 const store = createStore();
 const app = express();
-app.use(helmet({ contentSecurityPolicy: false }));
+// PHASE 2: strict CSP is now possible because all page JS lives in
+// external files under /js/ (no inline scripts, no inline handlers).
+app.use(helmet({ contentSecurityPolicy: { directives: {
+  defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'"],
+  imgSrc: ["'self'", 'data:'], connectSrc: ["'self'"],
+  frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"],
+} } }));
 app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, '..', 'public')));

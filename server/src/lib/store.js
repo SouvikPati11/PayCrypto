@@ -5,6 +5,7 @@
 // data on restart and must never be used with real funds. Production requires
 // MySQL (see db/migrations) and MEMORY_DB=false.
 const config = require('./config');
+const { toMysqlDatetime } = require('./dates');
 const { deriveBalance } = require('./ledger');
 
 let mysql = null;
@@ -149,6 +150,11 @@ class MemoryStore {
   async createWebhook(w) { const row = { id: this._id(), active: true, created_at: new Date().toISOString(), ...w }; this.webhooks.set(row.id, row); return row; }
   async getWebhooksFull(merchantId) { return [...this.webhooks.values()].filter((x) => x.merchant_id === Number(merchantId) && x.active); }
   async listWebhooks(merchantId) { return [...this.webhooks.values()].filter((x) => x.merchant_id === Number(merchantId)); }
+  async getWebhookById(id) { return this.webhooks.get(Number(id)) || null; }
+  async listDueWebhookLogs() {
+    const now = Date.now();
+    return this.webhookLogs.filter((x) => x.status === 'pending' && (x.attempts || 0) < 5 && (!x.next_retry_at || new Date(x.next_retry_at).getTime() <= now)).slice(0, 50);
+  }
   async queueWebhookLog(log) { const row = { id: this._id(), status: 'pending', attempts: 0, created_at: new Date().toISOString(), ...log }; this.webhookLogs.push(row); return row; }
   async listWebhookLogs(merchantId) { return this.webhookLogs.filter((x) => x.merchant_id === Number(merchantId)); }
   async updateWebhookLog(id, patch) { checkPatch(patch, 'webhookLog'); const l = this.webhookLogs.find((x) => x.id === Number(id)); if (l) Object.assign(l, patch); return l; }
@@ -205,7 +211,7 @@ class MysqlStore {
       const ex = await this.q('SELECT * FROM invoices WHERE merchant_id=? AND idempotency_key=?', [inv.merchant_id, inv.idempotency_key]);
       if (ex[0]) return { invoice: ex[0], duplicate: true };
     }
-    const r = await this.q('INSERT INTO invoices (merchant_id,reference,customer_email,amount_base_units,currency,network,status,expires_at,idempotency_key,metadata) VALUES (?,?,?,?,?,?,?,?,?,?)', [inv.merchant_id, inv.reference, inv.customer_email || null, inv.amount_base_units, 'USDT', 'BSC', 'pending', inv.expires_at, inv.idempotency_key || null, JSON.stringify(inv.metadata || {})]);
+    const r = await this.q('INSERT INTO invoices (merchant_id,reference,customer_email,amount_base_units,currency,network,status,expires_at,idempotency_key,metadata) VALUES (?,?,?,?,?,?,?,?,?,?)', [inv.merchant_id, inv.reference, inv.customer_email || null, inv.amount_base_units, 'USDT', 'BSC', 'pending', toMysqlDatetime(inv.expires_at), inv.idempotency_key || null, JSON.stringify(inv.metadata || {})]);
     return { invoice: await this.getInvoiceById(r.insertId), duplicate: false };
   }
   async getInvoiceById(id) { const r = await this.q('SELECT * FROM invoices WHERE id=?', [id]); return r[0] || null; }
@@ -245,13 +251,15 @@ class MysqlStore {
   async revokeApiKey(id) { await this.q('UPDATE api_keys SET revoked_at=NOW() WHERE id=?', [id]); return true; }
   async createWebhook(w) { const r = await this.q('INSERT INTO webhooks (merchant_id,url,secret_encrypted,events,active) VALUES (?,?,?,?,?)', [w.merchant_id, w.url, w.secret_encrypted, JSON.stringify(w.events || ['invoice.paid']), 1]); const rows = await this.q('SELECT * FROM webhooks WHERE id=?', [r.insertId]); return rows[0]; }
   async listWebhooks(merchantId) { return this.q('SELECT id,merchant_id,url,events,active,created_at FROM webhooks WHERE merchant_id=? ORDER BY id DESC', [merchantId]); }
+  async getWebhookById(id) { const r = await this.q('SELECT * FROM webhooks WHERE id=?', [id]); return r[0] || null; }
+  async listDueWebhookLogs() { return this.q("SELECT wl.*, w.url FROM webhook_logs wl JOIN webhooks w ON w.id=wl.webhook_id WHERE wl.status='pending' AND wl.attempts<5 AND (wl.next_retry_at IS NULL OR wl.next_retry_at<=NOW()) ORDER BY wl.id ASC LIMIT 50"); }
   async getWebhooksFull(merchantId) { return this.q('SELECT * FROM webhooks WHERE merchant_id=? AND active=1 ORDER BY id DESC', [merchantId]); }
   async queueWebhookLog(log) { const r = await this.q('INSERT INTO webhook_logs (webhook_id,merchant_id,invoice_id,event,payload,signature,status,attempts) VALUES (?,?,?,?,?,?,?,?)', [log.webhook_id, log.merchant_id, log.invoice_id || null, log.event, JSON.stringify(log.payload), log.signature || '', 'pending', 0]); return { id: r.insertId, ...log }; }
   async listWebhookLogs(merchantId) { return this.q('SELECT * FROM webhook_logs WHERE merchant_id=? ORDER BY id DESC LIMIT 200', [merchantId]); }
   async updateWebhookLog(id, patch) { checkPatch(patch, 'webhookLog'); const keys = Object.keys(patch); await this.q(`UPDATE webhook_logs SET ${keys.map((k) => `\`${k}\`=?`).join(',')} WHERE id=?`, [...Object.values(patch), id]); return true; }
   async logAudit(a) { await this.q('INSERT INTO audit_logs (actor_type,actor_id,action,entity_type,entity_id,details,ip_address) VALUES (?,?,?,?,?,?,?)', [a.actor_type, a.actor_id || null, a.action, a.entity_type || null, a.entity_id || null, JSON.stringify(a.details || {}), a.ip_address || null]); return true; }
   async listAuditLogs() { return this.q('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 200'); }
-  async createSession(sess) { await this.q('INSERT INTO login_sessions (user_id,token_hash,ip_address,user_agent,expires_at) VALUES (?,?,?,?,?)', [sess.user_id, sess.token_hash, sess.ip_address || null, sess.user_agent || null, sess.expires_at || null]); return sess; }
+  async createSession(sess) { await this.q('INSERT INTO login_sessions (user_id,token_hash,ip_address,user_agent,expires_at) VALUES (?,?,?,?,?)', [sess.user_id, sess.token_hash, sess.ip_address || null, sess.user_agent || null, toMysqlDatetime(sess.expires_at) || null]); return sess; }
   async findSessionByTokenHash(hash) { const r = await this.q('SELECT * FROM login_sessions WHERE token_hash=? AND revoked_at IS NULL', [hash]); return r[0] || null; }
   async revokeSessionByTokenHash(hash) { await this.q('UPDATE login_sessions SET revoked_at=NOW() WHERE token_hash=?', [hash]); return true; }
   async getCheckpoint() { const r = await this.q('SELECT * FROM monitor_checkpoints WHERE network=?', [config.network]); return r[0] || { network: config.network, last_block_number: 0, last_block_hash: '' }; }
