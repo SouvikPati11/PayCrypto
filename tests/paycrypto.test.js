@@ -275,3 +275,149 @@ test('phase2: due webhook logs only include pending, under-5-attempt, due logs',
   assert.ok(dueList.some((x) => x.id === due.id));
   assert.ok(!dueList.some((x) => x.id === notDue.id));
 });
+
+// ---- PHASE 4 tests (BSC testnet verification & payment scenarios) ----
+// NOTE: these are deterministic simulations of on-chain transfers.
+// No real funds, no private keys, no live transaction is sent by any
+// test here. Live testnet sending is a manual step (see TESTNET.md).
+const { verifyTokenContract, validateChainId } = require('../server/src/lib/blockchain');
+const TESTNET_TOKEN = '0x1111111111111111111111111111111111112222'; // simulated testnet token, NOT a real contract
+
+async function phase4Setup(amountUsdt = '10') {
+  const store = new MemoryStore();
+  store.setAddressDeriver((i) => deriveAddressFromMnemonic(TEST_MNEMONIC, i));
+  const merchant = await store.createMerchant({ user_id: null, business_name: 'P4', contact_email: 'p4@example.com', status: 'approved' });
+  const { invoice } = await store.createInvoice({ merchant_id: merchant.id, reference: 'PC-P4-' + Math.random().toString(36).slice(2, 8).toUpperCase(), amount_base_units: parseUsdt(amountUsdt).toString(), expires_at: new Date(Date.now() + 3600_000).toISOString() });
+  const addr = await store.allocateDepositAddress({ merchantId: merchant.id, invoiceId: invoice.id });
+  await store.updateInvoice(invoice.id, { deposit_address: addr.address, deposit_address_id: addr.id });
+  return { store, merchant, invoice: await store.getInvoiceById(invoice.id), addr };
+}
+function txFor(addr, valueUsdt, { txHash, logIndex = 0, blockNumber = 100, receiptStatus = true, tokenContract = TESTNET_TOKEN } = {}) {
+  return { from: '0x1111111111111111111111111111111111111111', to: addr.address, value: parseUsdt(valueUsdt), txHash: txHash || ('0x' + 'cc'.repeat(32)), logIndex, blockNumber, tokenContract, receiptStatus };
+}
+const P4_OPTS = (currentBlock = 112) => ({ tokenContract: TESTNET_TOKEN, confirmations: 12, currentBlock });
+
+test('phase4: HD deposit addresses are unique per invoice and deterministic', async () => {
+  const a = await phase4Setup();
+  assert.equal(a.addr.address, deriveAddressFromMnemonic(TEST_MNEMONIC, 0));
+  // Second invoice in the same store gets the next index, not a reuse.
+  const { invoice } = await a.store.createInvoice({ merchant_id: a.merchant.id, reference: 'PC-P4-SECOND', amount_base_units: parseUsdt('1').toString(), expires_at: new Date(Date.now() + 3600_000).toISOString() });
+  const addr2 = await a.store.allocateDepositAddress({ merchantId: a.merchant.id, invoiceId: invoice.id });
+  assert.notEqual(addr2.address, a.addr.address);
+  assert.equal(addr2.address, deriveAddressFromMnemonic(TEST_MNEMONIC, 1));
+  // A fresh store with the same mnemonic re-derives the same index 0
+  // address — determinism, not a collision: uniqueness is per store.
+  const b = await phase4Setup();
+  assert.equal(b.addr.address, a.addr.address);
+});
+
+test('phase4: exact payment, confirming then confirmed, credits ledger once', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  const confirming = await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '11'.repeat(32) }), P4_OPTS(105));
+  assert.equal(confirming.status, 'confirming'); assert.equal(confirming.credited, false);
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+  const confirmed = await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '11'.repeat(32) }), P4_OPTS(112));
+  assert.equal(confirmed.status, 'confirmed'); assert.equal(confirmed.credited, true); assert.equal(confirmed.duplicate, true);
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'paid');
+  assert.equal(await store.merchantBalance(merchant.id), parseUsdt('10'));
+});
+
+test('phase4: contract validation — wrong token, wrong symbol, wrong decimals, chain mismatch all fail closed', async () => {
+  const { store, addr } = await phase4Setup();
+  // Wrong contract address is ignored, never credited.
+  const wrong = await processTransfer(store, txFor(addr, '10', { tokenContract: OTHER_TOKEN }), P4_OPTS());
+  assert.equal(wrong.ignored, true); assert.equal(await store.merchantBalance(1), 0n);
+  // verifyTokenContract against a mock provider that returns encoded
+  // ERC20 name/symbol/decimals: correct token passes, wrong symbol or
+  // decimals is rejected, and chain-ID validation is enforced.
+  const { ethers } = require('ethers');
+  const { ERC20_ABI } = require('../server/src/lib/blockchain');
+  const iface = new ethers.Interface(ERC20_ABI);
+  const coder = new ethers.AbiCoder();
+  const sel = (fn) => iface.getFunction(fn).selector;
+  const mockProvider = (sym, dec) => ({
+    getNetwork: async () => ({ chainId: 97n }),
+    call: async (tx) => {
+      if (tx.data.startsWith(sel('name'))) return coder.encode(['string'], ['Test USDT']);
+      if (tx.data.startsWith(sel('symbol'))) return coder.encode(['string'], [sym]);
+      if (tx.data.startsWith(sel('decimals'))) return coder.encode(['uint8'], [dec]);
+      throw new Error('unknown function');
+    },
+  });
+  assert.deepEqual(await verifyTokenContract(mockProvider('USDT', 18), TESTNET_TOKEN, { symbol: 'USDT', decimals: 18 }), { name: 'Test USDT', symbol: 'USDT', decimals: 18 });
+  await assert.rejects(() => verifyTokenContract(mockProvider('TUSDT', 18), TESTNET_TOKEN, { symbol: 'USDT', decimals: 18 }), /Token contract mismatch/);
+  await assert.rejects(() => verifyTokenContract(mockProvider('USDT', 6), TESTNET_TOKEN, { symbol: 'USDT', decimals: 18 }), /Token contract mismatch/);
+  assert.equal(isCanonicalTokenContract(TESTNET_TOKEN, TESTNET_TOKEN), true);
+  assert.equal(isCanonicalTokenContract(OTHER_TOKEN, TESTNET_TOKEN), false);
+  await assert.rejects(() => validateChainId({ getNetwork: async () => ({ chainId: 56n }) }, 97), /Chain ID mismatch/);
+  assert.equal(await validateChainId({ getNetwork: async () => ({ chainId: 97n }) }, 97), true);
+});
+
+test('phase4: failed receipt never credits, and missing receipt never credits (fail-closed)', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  const failed = await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '22'.repeat(32), receiptStatus: false }), P4_OPTS());
+  assert.equal(failed.status, 'failed'); assert.equal(failed.credited, false);
+  const missingTx = txFor(addr, '10', { txHash: '0x' + '23'.repeat(32) }); delete missingTx.receiptStatus;
+  const missing = await processTransfer(store, missingTx, P4_OPTS());
+  assert.equal(missing.status, 'failed'); assert.equal(missing.credited, false);
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'pending');
+});
+
+test('phase4: underpayment and overpayment classification, partial ledger credit documented', async () => {
+  const u = await phase4Setup();
+  await processTransfer(u.store, txFor(u.addr, '4', { txHash: '0x' + '31'.repeat(32) }), P4_OPTS());
+  assert.equal((await u.store.getInvoiceById(u.invoice.id)).status, 'underpaid');
+  assert.equal(await u.store.merchantBalance(u.merchant.id), parseUsdt('4'));
+  const o = await phase4Setup();
+  await processTransfer(o.store, txFor(o.addr, '12', { txHash: '0x' + '32'.repeat(32) }), P4_OPTS());
+  assert.equal((await o.store.getInvoiceById(o.invoice.id)).status, 'overpaid');
+  assert.equal(await o.store.merchantBalance(o.merchant.id), parseUsdt('12'));
+});
+
+test('phase4: duplicate tx+logIndex never credits twice; different logIndex in same tx credits separately', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '41'.repeat(32) }), P4_OPTS());
+  const dup = await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '41'.repeat(32) }), P4_OPTS());
+  assert.equal(dup.duplicate, true); assert.equal(dup.credited, false);
+  assert.equal(await store.merchantBalance(merchant.id), parseUsdt('10'));
+  // Same tx hash, different log index = a second, distinct transfer.
+  const second = await processTransfer(store, txFor(addr, '5', { txHash: '0x' + '41'.repeat(32), logIndex: 1 }), P4_OPTS());
+  assert.equal(second.credited, true);
+  assert.equal(await store.merchantBalance(merchant.id), parseUsdt('15'));
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'paid');
+});
+
+test('phase4: reorg — confirming transfer vanishing from re-scan is orphaned, never credited', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '51'.repeat(32) }), P4_OPTS(105));
+  const { reconcileOrphaned } = require('../server/src/lib/monitor');
+  assert.equal(await reconcileOrphaned(store, { scannedKeys: new Set(), fromBlock: 90, toBlock: 110 }), 1);
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+});
+
+test('phase4: testnet/mainnet isolation — mainnet contract transfer never credits a testnet-configured invoice', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  const mainnetTx = await processTransfer(store, txFor(addr, '10', { tokenContract: MAINNET_USDT }), { tokenContract: TESTNET_TOKEN, confirmations: 12, currentBlock: 112 });
+  assert.equal(mainnetTx.ignored, true);
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+  assert.equal((await store.getInvoiceById(invoice.id)).status, 'pending');
+  // And the reverse: a testnet-token transfer against a mainnet expectation is ignored.
+  const reverse = await processTransfer(store, txFor(addr, '10', { tokenContract: TESTNET_TOKEN }), { tokenContract: MAINNET_USDT, confirmations: 12, currentBlock: 112 });
+  assert.equal(reverse.ignored, true);
+});
+
+test('phase4: ledger crediting + withdrawal approval flow without real funds', async () => {
+  const { store, merchant, invoice, addr } = await phase4Setup();
+  await processTransfer(store, txFor(addr, '10', { txHash: '0x' + '61'.repeat(32) }), P4_OPTS());
+  assert.equal(await store.merchantBalance(merchant.id), parseUsdt('10'));
+  const w = await store.createWithdrawal({ merchant_id: merchant.id, destination_address: '0x2222222222222222222222222222222222222222', amount_base_units: parseUsdt('10').toString(), fee_base_units: parseUsdt('1').toString(), net_base_units: parseUsdt('9').toString() });
+  assert.equal(w.status, 'pending');
+  // Admin approval alone does not debit: debit happens only on on-chain confirmation (admin route, Phase 1/2).
+  // Here we verify the validation that gates it: 10 gross with 1 fee is allowed against a 10 balance.
+  const { validateWithdrawal } = require('../server/src/lib/ledger');
+  assert.equal(validateWithdrawal({ availableBaseUnits: parseUsdt('10'), amountUsdt: '10', feeUsdt: '1', minUsdt: '10', maxUsdt: '10000' }).ok, true);
+  // Simulating the confirmed-withdrawal debit:
+  await store.addLedgerEntry({ merchant_id: merchant.id, withdrawal_id: w.id, entry_type: 'debit', amount_base_units: parseUsdt('10').toString(), description: 'Withdrawal confirmed', reference_key: `withdrawal:${w.id}` });
+  assert.equal(await store.merchantBalance(merchant.id), 0n);
+});

@@ -61,7 +61,10 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
   if (!addressRow) return { ignored: true, reason: 'unknown deposit address' };
   const inv = invoice || (addressRow.invoice_id ? await store.getInvoiceById(addressRow.invoice_id) : null);
   const conf = Math.max(0, currentBlock - transfer.blockNumber);
-  const status = transfer.receiptStatus === false ? 'failed' : conf >= confirmations ? 'confirmed' : 'confirming';
+  // PHASE 4 (fail-closed): only an explicit successful receipt counts.
+  // A missing receipt (undefined) must never credit — previously it could.
+  const receiptOk = transfer.receiptStatus === true;
+  const status = !receiptOk ? 'failed' : conf >= confirmations ? 'confirmed' : 'confirming';
   const { tx, duplicate } = await store.recordBlockchainTx({
     tx_hash: transfer.txHash, log_index: transfer.logIndex, block_number: transfer.blockNumber,
     block_hash: transfer.blockHash || null, from_address: transfer.from, to_address: transfer.to,
@@ -80,7 +83,12 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
     return { ignored: true, credited: false, reason: 'invoice expired — payment recorded, not credited', txId: tx.id, status };
   }
   let credited = false;
-  if (status === 'confirmed' && inv && inv.status !== 'paid' && inv.status !== 'cancelled') {
+  // PHASE 4: a second confirmed transfer to an already-paid invoice
+  // (e.g. a customer sends twice) must still be credited to the
+  // merchant ledger — the funds were received — but the invoice
+  // stays 'paid' and is not reclassified. Cancelled/expired invoices
+  // never credit (expired handled above).
+  if (status === 'confirmed' && inv && inv.status !== 'cancelled') {
     try {
       await store.addLedgerEntry({
         merchant_id: inv.merchant_id, invoice_id: inv.id, blockchain_tx_id: tx.id,
@@ -94,8 +102,10 @@ async function processTransfer(store, transfer, { tokenContract, confirmations, 
     const all = await store.listTxs({ merchant_id: inv.merchant_id });
     const confirmedSum = all.filter((t) => t.invoice_id === inv.id && t.status === 'confirmed').reduce((a, t) => a + BigInt(t.amount_base_units), 0n);
     const confirmingSum = all.filter((t) => t.invoice_id === inv.id && t.status === 'confirming').reduce((a, t) => a + BigInt(t.amount_base_units), 0n);
-    const newStatus = classifyInvoice({ expected: BigInt(inv.amount_base_units), receivedConfirmed: confirmedSum, receivedConfirming: confirmingSum, expiresAt: inv.expires_at });
-    await store.updateInvoice(inv.id, { status: newStatus });
+    if (inv.status !== 'paid') {
+      const newStatus = classifyInvoice({ expected: BigInt(inv.amount_base_units), receivedConfirmed: confirmedSum, receivedConfirming: confirmingSum, expiresAt: inv.expires_at });
+      await store.updateInvoice(inv.id, { status: newStatus });
+    }
     if (credited) await store.logAudit({ actor_type: 'system', action: 'invoice.credited', entity_type: 'invoice', entity_id: inv.id, details: { tx_hash: transfer.txHash, amount_usdt: formatUsdt(transfer.value) } });
   }
   return { ignored: false, duplicate, credited, txId: tx.id, status };

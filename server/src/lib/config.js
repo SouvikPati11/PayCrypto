@@ -26,8 +26,8 @@ const config = {
   rpcUrl:
     process.env.BSC_RPC_URL ||
     (network === 'mainnet'
-      ? process.env.BSC_RPC_URL_MAINNET || 'https://bsc-dataseed.binance.org'
-      : process.env.BSC_RPC_URL_TESTNET || 'https://data-seed-prebsc-1-s1.binance.org:8545'),
+      ? process.env.BSC_RPC_URL_MAINNET || 'https://bsc-dataseed.bnbchain.org'
+      : process.env.BSC_RPC_URL_TESTNET || 'https://bsc-testnet-dataseed.bnbchain.org'),
   usdtContract: {
     mainnet: (process.env.USDT_CONTRACT_MAINNET || '0x55d398326f99059fF775485246999027B3197955').toLowerCase(),
     // Intentionally empty by default: testnet has no single canonical USDT.
