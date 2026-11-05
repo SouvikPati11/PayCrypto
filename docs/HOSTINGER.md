@@ -22,10 +22,27 @@ in this design requires one.
 
 ## 3. Environment
 
-Copy `.env.example` to `.env` in the app root and set:
+Set these in **hPanel > Node.js app > Environment Variables**
+— NOT only in a `.env` file. This app has **no dotenv
+dependency and never reads a `.env` file**: it reads
+`process.env` only, so a `.env` file on disk, however correct,
+does not reach the app. (If you set credentials only in `.env`,
+the app falls back to `DB_USER=paycrypto_user` with an empty
+password and MySQL answers `ER_ACCESS_DENIED_ERROR` — see
+`docs/DB_AUTH_DIAGNOSIS.md`.) After changing any env var,
+click **Restart application**: config is read once at startup
+and a running process keeps the old values.
 
 - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_NAME`, `DB_PASSWORD`
-  (from hPanel > Databases — never commit this file).
+  (from hPanel > Databases — never commit these values).
+  `DB_HOST` is `localhost`, `DB_PORT` is `3306`, and
+  `DB_USER` / `DB_NAME` must be the **full prefixed names**
+  exactly as shown in hPanel > Databases (e.g.
+  `u123456789_paycrypto_user` / `u123456789_paycrypto`) —
+  the `uXXXXXXXX_` prefix cannot be removed. Each database
+  has exactly one user: use the user created for that database,
+  and keep the password in the Node app env vars identical to
+  the one set in hPanel > Databases.
 - `JWT_SECRET`, `SESSION_SECRET`, `ENCRYPTION_KEY` (64 hex chars,
   long random values, different from each other).
 - `BASE_URL` = your public domain with https.

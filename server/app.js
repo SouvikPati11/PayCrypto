@@ -30,7 +30,8 @@ const { createStore } = require('./src/lib/store');
 const { verifySession, tokenHash } = require('./src/lib/auth');
 const { verifyCsrf, csrfRequired } = require('./src/lib/csrf');
 const { deriveAddressFromXpub } = require('./src/lib/wallet');
-const { isDbError } = require('./src/lib/db-error');
+const { isDbError, sanitizeDbError } = require('./src/lib/db-error');
+const { dbConfigDiagnostics, dotenvStatus } = require('./src/lib/db-diagnostics');
 const { pages, payPage } = require('./src/views');
 
 const STARTED_AT = Date.now();
@@ -48,6 +49,15 @@ const readiness = {
   dbMode: config.memoryDb ? 'memory' : 'mysql',
   lastCheckedAt: null,
   lastError: null,
+  // Sanitised DB failure detail (code/errno/sqlState/user@host only —
+  // never a password or connection string) and the safe identity the
+  // app attempted (host/port/user/database + password facts only).
+  // This is what distinguishes "wrong user", "wrong password",
+  // "user not granted from this host" and "unknown database" on
+  // Hostinger, where the old code only kept the error code.
+  dbError: null,
+  dbConfig: dbConfigDiagnostics(config),
+  dotenv: dotenvStatus(),
 };
 
 app.use(helmet({ contentSecurityPolicy: { directives: {
@@ -110,8 +120,9 @@ async function checkReadiness() {
   } catch (e) {
     readiness.db = 'unavailable';
     readiness.lastError = e.code || 'DB_ERROR';
+    readiness.dbError = sanitizeDbError(e);
     readiness.deriver = 'failed';
-    console.warn(`[startup] Database unavailable (${readiness.lastError}). API routes will return 503 until it recovers; the HTTP server stays up.`);
+    console.warn(`[startup] Database unavailable: ${JSON.stringify(readiness.dbError)}. Attempted: ${JSON.stringify(readiness.dbConfig)}. API routes will return 503 until it recovers; the HTTP server stays up.`);
     readiness.lastCheckedAt = new Date().toISOString();
     return readiness;
   }
@@ -121,7 +132,8 @@ async function checkReadiness() {
   } catch (e) {
     readiness.deriver = 'failed';
     readiness.lastError = e.code || 'DB_ERROR';
-    console.warn(`[startup] HD deriver failed (${readiness.lastError}). Invoice creation will fail until wallet_xpub is set and the database recovers.`);
+    readiness.dbError = sanitizeDbError(e);
+    console.warn(`[startup] HD deriver failed: ${JSON.stringify(readiness.dbError)}. Invoice creation will fail until wallet_xpub is set and the database recovers.`);
   }
   return readiness;
 }
@@ -162,6 +174,9 @@ app.get('/health', (req, res) => res.json({
   db: readiness.db,
   deriver: readiness.deriver,
   last_error: readiness.lastError,
+  db_error: readiness.dbError,
+  db_config: readiness.dbConfig,
+  dotenv: readiness.dotenv,
   last_checked_at: readiness.lastCheckedAt,
   network: config.network, chain_id: config.chainId,
   payments_live: config.paymentsLive, emergency_pause: config.emergencyPause,
@@ -172,7 +187,7 @@ app.get('/health', (req, res) => res.json({
 // app can serve database-dependent traffic yet.
 app.get('/ready', (req, res) => {
   if (readiness.db !== 'ready') {
-    return res.status(503).json({ ok: false, db: readiness.db, deriver: readiness.deriver, last_error: readiness.lastError, message: 'Database unavailable' });
+    return res.status(503).json({ ok: false, db: readiness.db, deriver: readiness.deriver, last_error: readiness.lastError, db_error: readiness.dbError, db_config: readiness.dbConfig, message: 'Database unavailable' });
   }
   return res.json({ ok: true, db: readiness.db, deriver: readiness.deriver });
 });

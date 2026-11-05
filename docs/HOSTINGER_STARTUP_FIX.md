@@ -130,6 +130,20 @@ Node compatibility: `engines: >=20` in `package.json`, no
 Node-22-only APIs are used by this fix. Verified on Node 24
 locally; the code path is the same on Node 20.
 
+## Update 3 — MySQL auth diagnosis (ER_ACCESS_DENIED_ERROR, 2026-11-05)
+
+A 1045 after the startup fixes is a credentials problem, not a
+startup problem: see `docs/DB_AUTH_DIAGNOSIS.md`. In short, the
+app reads exactly `DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME`
+from `process.env` only (no dotenv — a `.env` file is ignored),
+config is read once at startup (restart after any change), and
+Hostinger database/user names carry a non-removable
+`uXXXXXXXX_` prefix. `/health` now reports a sanitised
+`db_error` (code/errno/sqlState/user@host) and `db_config`
+(identity + password length/whitespace flags only, never the
+password), and `node scripts/db-diagnose.js` runs the same
+check read-only.
+
 ## Update 2 — entry-file architecture (2026-11-05, second Hostinger failure mode)
 
 Hostinger's runtime logs warned the entry file may be loaded without

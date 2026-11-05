@@ -3,6 +3,13 @@
 // Production activation is gated: PAYMENTS_LIVE=false means invoices can be
 // created and testnet transfers can be monitored, but no real-money custody
 // or automatic withdrawal is claimed or performed.
+// Env-var hygiene for DB auth: Hostinger / copy-paste values often carry
+// a trailing space or newline, which MySQL treats as part of the name
+// and answers with ER_ACCESS_DENIED_ERROR. Identifiers are trimmed.
+// DB_PASSWORD is deliberately NOT trimmed: it is used exactly as set,
+// and the diagnostic in lib/db-diagnostics.js flags accidental
+// leading/trailing whitespace instead of silently changing it.
+function trimEnv(v) { return typeof v === 'string' ? v.trim() : v; }
 const network = (process.env.BSC_NETWORK || 'testnet').toLowerCase();
 const chainId = network === 'mainnet' ? 56 : 97;
 
@@ -12,11 +19,11 @@ const config = {
   baseUrl: process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`,
   memoryDb: process.env.MEMORY_DB === 'true',
   db: {
-    host: process.env.DB_HOST || 'localhost',
+    host: trimEnv(process.env.DB_HOST) || 'localhost',
     port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || 'paycrypto_user',
+    user: trimEnv(process.env.DB_USER) || 'paycrypto_user',
     password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'paycrypto',
+    database: trimEnv(process.env.DB_NAME) || 'paycrypto',
   },
   jwtSecret: process.env.JWT_SECRET || 'dev-only-insecure-secret-change-me',
   sessionSecret: process.env.SESSION_SECRET || 'dev-only-insecure-secret-change-me',

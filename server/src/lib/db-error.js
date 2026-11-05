@@ -16,4 +16,5 @@ function isDbError(err) {
   if (typeof err.message === 'string' && /connect|mysql|database/i.test(err.message) && /(ECONN|ETIMEDOUT|ENOTFOUND|ER_)/.test(err.message)) return true;
   return false;
 }
-module.exports = { isDbError };
+const { sanitizeDbError } = require('./db-diagnostics');
+module.exports = { isDbError, sanitizeDbError };

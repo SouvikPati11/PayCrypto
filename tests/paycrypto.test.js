@@ -584,6 +584,14 @@ test('hostinger: server listens within 3s with MySQL down (closed port), /health
     assert.equal(body.last_error, 'ECONNREFUSED');
     assert.doesNotMatch(JSON.stringify(body), /secret-password-must-not-leak/);
     assert.doesNotMatch(getLog(), /secret-password-must-not-leak/);
+    // Safe diagnostic: sanitised error + attempted identity, password only as facts.
+    assert.equal(body.db_error.code, 'ECONNREFUSED');
+    assert.equal(body.db_config.user, 'test');
+    assert.equal(body.db_config.database, 'paycrypto');
+    assert.equal(body.db_config.password.present, true);
+    assert.equal(body.db_config.password.length, 'secret-password-must-not-leak'.length);
+    assert.equal(body.dotenv.dotenv_installed, false);
+    assert.equal(body.dotenv.env_file_read_by_app, false);
     const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
     assert.equal(readyRes.status, 503);
     const loginRes = await fetch(`http://127.0.0.1:${port}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'a@b.com', password: 'long-password-123' }) });
@@ -663,4 +671,91 @@ test('hostinger entry: startServer() starts only once per process', async () => 
   // waits for the fetch agent's idle socket and the test runner hangs.
   if (typeof first.closeAllConnections === 'function') first.closeAllConnections();
   await new Promise((res) => first.close(res));
+});
+
+// ---- DB AUTH DIAGNOSTICS tests (ER_ACCESS_DENIED_ERROR) ----
+const { sanitizeDbError, dbConfigDiagnostics, dotenvStatus } = require('../server/src/lib/db-diagnostics');
+
+test('db auth: sanitizeDbError parses access-denied, never reproduces raw text', () => {
+  const err = new Error("Access denied for user 'u123456789_paycrypto_user'@'localhost' (using password: YES)");
+  err.code = 'ER_ACCESS_DENIED_ERROR'; err.errno = 1045; err.sqlState = '28000';
+  const safe = sanitizeDbError(err);
+  assert.equal(safe.code, 'ER_ACCESS_DENIED_ERROR');
+  assert.equal(safe.errno, 1045);
+  assert.equal(safe.sql_state, '28000');
+  assert.equal(safe.attempted_user, 'u123456789_paycrypto_user');
+  assert.equal(safe.attempted_host, 'localhost');
+  assert.equal(safe.using_password, 'YES');
+  assert.equal(safe.message, "Access denied for user 'u123456789_paycrypto_user'@'localhost' (using password: YES)");
+  // A raw message that (hypothetically) echoed a credential is never reproduced.
+  const evil = new Error("Access denied for user 'x'@'localhost' (using password: YES) password=hunter2-secret");
+  evil.code = 'ER_ACCESS_DENIED_ERROR'; evil.errno = 1045; evil.sqlState = '28000';
+  assert.doesNotMatch(JSON.stringify(sanitizeDbError(evil)), /hunter2-secret/);
+  assert.equal(sanitizeDbError(null), null);
+  const unknownDb = new Error("Unknown database 'paycrypto'");
+  unknownDb.code = 'ER_BAD_DB_ERROR'; unknownDb.errno = 1049; unknownDb.sqlState = '42000';
+  assert.equal(sanitizeDbError(unknownDb).message, "Unknown database 'paycrypto'");
+  const hostDenied = new Error("Host '1.2.3.4' is not allowed to connect to this MySQL server");
+  hostDenied.code = 'ER_HOST_NOT_PRIVILEGED'; hostDenied.errno = 1130;
+  assert.equal(sanitizeDbError(hostDenied).attempted_host, '1.2.3.4');
+  const weird = new Error('something internal with a secret token=abc123');
+  weird.code = 'ER_UNKNOWN_ERROR';
+  assert.equal(sanitizeDbError(weird).message, 'Database error (ER_UNKNOWN_ERROR)');
+  assert.doesNotMatch(JSON.stringify(sanitizeDbError(weird)), /abc123/);
+});
+
+test('db auth: dbConfigDiagnostics reports identity + password facts only', () => {
+  const diag = dbConfigDiagnostics({ db: { host: 'localhost', port: 3306, user: 'u1_test', password: ' secret-with-space ', database: 'u1_db' } });
+  assert.equal(diag.host, 'localhost');
+  assert.equal(diag.user, 'u1_test');
+  assert.equal(diag.database, 'u1_db');
+  assert.equal(diag.password.present, true);
+  assert.equal(diag.password.length, ' secret-with-space '.length);
+  assert.equal(diag.password.has_leading_trailing_whitespace, true);
+  assert.equal(diag.password.quoted, false);
+  assert.equal(dbConfigDiagnostics({ db: { host: 'h', port: 3306, user: 'u', password: '"quoted-pw"', database: 'd' } }).password.quoted, true);
+  assert.doesNotMatch(JSON.stringify(diag), /secret-with-space/);
+  const d = dotenvStatus();
+  assert.equal(d.dotenv_installed, false);
+  assert.equal(d.env_file_read_by_app, false);
+});
+
+test('db auth: no dotenv dependency, so a .env file can never configure the app', () => {
+  const pkg = require('../package.json');
+  assert.equal(pkg.dependencies && pkg.dependencies.dotenv, undefined);
+  assert.equal(require('node:fs').readFileSync(__dirname + '/../server/src/lib/config.js', 'utf8').includes('dotenv'), false);
+});
+
+test('db auth: config trims DB_HOST/DB_USER/DB_NAME but uses DB_PASSWORD exactly', async () => {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', "const c=require('./server/src/lib/config'); console.log(JSON.stringify(c.db))"], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, DB_HOST: '  localhost  ', DB_PORT: '3306', DB_USER: '  u1_test  ', DB_PASSWORD: '  spaced-pw  ', DB_NAME: '  u1_db\n' },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const code = await new Promise((res) => child.on('close', res));
+  assert.equal(code, 0, out);
+  const db = JSON.parse(out.trim());
+  assert.equal(db.host, 'localhost');
+  assert.equal(db.user, 'u1_test');
+  assert.equal(db.database, 'u1_db');
+  assert.equal(db.password, '  spaced-pw  ', 'password must be used exactly, not trimmed');
+});
+
+test('db auth: scripts/db-diagnose.js reports a sanitised failure and never prints the password', async () => {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['scripts/db-diagnose.js'], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, DB_HOST: '127.0.0.1', DB_PORT: '59999', DB_USER: 'test', DB_PASSWORD: 'secret-password-must-not-leak', DB_NAME: 'paycrypto', NODE_ENV: 'development' },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const code = await new Promise((res) => child.on('close', res));
+  assert.equal(code, 1);
+  assert.match(out, /ECONNREFUSED/);
+  assert.match(out, /"user": "test"/);
+  assert.doesNotMatch(out, /secret-password-must-not-leak/);
 });
