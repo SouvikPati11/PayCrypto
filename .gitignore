@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+config/wallet.enc.json
+config/*.enc.json
+*.key
+*.pem
+wallet-backup*.txt
+secrets/
+dist/
+.DS_Store
+*.log
+coverage/
