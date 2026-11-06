@@ -16,7 +16,8 @@
       const wh = await PayCrypto.api('/api/v1/webhooks');
       PayCrypto.renderTable('whTable', wh.webhooks.map((w) => ({ url: w.url, active: w.active ? 'yes' : 'no' })), ['url', 'active']);
     } catch (e) {
-      document.body.insertAdjacentHTML('beforeend', '<p class="muted">Login required for dashboard data. <a href="/login">Login</a></p>');
+      if (e.status === 401 || e.status === 403) { location.href = '/login'; return; }
+      document.body.insertAdjacentHTML('beforeend', '<p class="muted">Dashboard could not load: ' + PayCrypto.escapeHtml(e.message) + ' <a href="/login">Login</a></p>');
     }
   })();
   const invForm = el('invForm');

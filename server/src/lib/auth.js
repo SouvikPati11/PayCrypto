@@ -5,6 +5,15 @@ const jwt = require('jsonwebtoken');
 const { authenticator } = require('otplib');
 const config = require('./config');
 
+// Email is an identifier, not a secret: trim + lowercase it the same way
+// at every boundary (seed, register, login, recovery). Without this, an
+// ADMIN_EMAIL pasted with a leading space or uppercase at seed time is
+// stored verbatim and login with the clean address can never find the
+// account — a proven cause of "Invalid credentials" for an account that
+// visibly exists. Passwords are NEVER normalised: they are used exactly
+// as typed, including any spaces.
+function normalizeEmail(email) { return String(email ?? '').trim().toLowerCase(); }
+
 async function hashPassword(password) { return bcrypt.hash(password, 12); }
 async function verifyPassword(password, hash) { return bcrypt.compare(password, hash); }
 
@@ -53,4 +62,4 @@ function can(role, permission) {
   return perms.includes('*') || perms.includes(permission);
 }
 
-module.exports = { hashPassword, verifyPassword, signSession, verifySession, tokenHash, generateApiKey, hashApiKey, newTotpSecret, totpToken, verifyTotp, totpAuthUrl, ADMIN_PERMISSIONS, can };
+module.exports = { normalizeEmail, hashPassword, verifyPassword, signSession, verifySession, tokenHash, generateApiKey, hashApiKey, newTotpSecret, totpToken, verifyTotp, totpAuthUrl, ADMIN_PERMISSIONS, can };

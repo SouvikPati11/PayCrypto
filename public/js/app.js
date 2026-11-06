@@ -12,7 +12,7 @@ async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(csrf ? { 'X-CSRF-Token': csrf } : {}), ...(opts.headers || {}) };
   const r = await fetch(path, { headers, ...opts });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error?.message || data.error || 'Request failed');
+  if (!r.ok) { const err = new Error(data.error?.message || data.error || 'Request failed'); err.status = r.status; throw err; }
   return data;
 }
 function el(id) { return document.getElementById(id); }
@@ -28,4 +28,14 @@ function renderTable(target, rows, cols, options = {}) {
   t.innerHTML = '<table><tr>' + cols.map((c) => `<th>${escapeHtml(c)}</th>`).join('') + '</tr>' +
     rows.map((r) => '<tr>' + cols.map((c) => `<td>${raw.has(c) ? (r[c] ?? '') : escapeHtml(r[c])}</td>`).join('') + '</tr>').join('') + '</table>';
 }
+// Shared logout button (present on the merchant and admin dashboards).
+// The session cookie is httpOnly, so logout is a POST, not a link.
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('logoutBtn');
+  if (!btn) return;
+  btn.onclick = async () => {
+    try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+    location.href = '/login';
+  };
+});
 window.PayCrypto = { api, renderTable, escapeHtml };

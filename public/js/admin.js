@@ -19,7 +19,10 @@
       const a = await PayCrypto.api('/api/admin/audit');
       PayCrypto.renderTable('aTable', a.logs.map((x) => ({ action: x.action, entity: x.entity_type, at: x.created_at })), ['action', 'entity', 'at']);
     } catch (e) {
-      document.body.insertAdjacentHTML('beforeend', '<p class="muted">Admin login required. <a href="/login">Login</a></p>');
+      // No session, expired/invalid token, or a merchant opening the admin
+      // dashboard: send them to login instead of showing an empty page.
+      if (e.status === 401 || e.status === 403) { location.href = '/login'; return; }
+      document.body.insertAdjacentHTML('beforeend', '<p class="muted">Admin dashboard could not load: ' + PayCrypto.escapeHtml(e.message) + ' <a href="/login">Login</a></p>');
     }
   })();
   document.addEventListener('click', async (e) => {

@@ -206,6 +206,7 @@ app.get('/login', (req, res) => res.send(pages.login()));
 app.get('/register', (req, res) => res.send(pages.register()));
 app.get('/merchant', (req, res) => res.send(pages.merchant()));
 app.get('/admin', (req, res) => res.send(pages.admin()));
+app.get('/admin-recover', (req, res) => res.send(pages.recover()));
 app.get('/pay/:reference', async (req, res) => {
   try {
     const inv = await store.getInvoiceByReference(req.params.reference);

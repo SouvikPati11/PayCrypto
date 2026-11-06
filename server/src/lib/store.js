@@ -164,6 +164,7 @@ class MemoryStore {
   async createSession(sess) { const row = { id: this._id(), revoked_at: null, created_at: new Date().toISOString(), ...sess }; this.sessions.set(row.token_hash, row); return row; }
   async findSessionByTokenHash(hash) { const row = this.sessions.get(hash); return row && !row.revoked_at ? row : null; }
   async revokeSessionByTokenHash(hash) { const row = this.sessions.get(hash); if (row) row.revoked_at = new Date().toISOString(); return !!row; }
+  async revokeSessionsByUserId(userId) { let n = 0; for (const row of this.sessions.values()) if (row.user_id === Number(userId) && !row.revoked_at) { row.revoked_at = new Date().toISOString(); n++; } return n; }
   async getCheckpoint() { return this.checkpoint; }
   async setCheckpoint(blockNumber, blockHash) { this.checkpoint = { network: config.network, last_block_number: blockNumber, last_block_hash: blockHash || '' }; return this.checkpoint; }
 }
@@ -264,6 +265,7 @@ class MysqlStore {
   async createSession(sess) { await this.q('INSERT INTO login_sessions (user_id,token_hash,ip_address,user_agent,expires_at) VALUES (?,?,?,?,?)', [sess.user_id, sess.token_hash, sess.ip_address || null, sess.user_agent || null, toMysqlDatetime(sess.expires_at) || null]); return sess; }
   async findSessionByTokenHash(hash) { const r = await this.q('SELECT * FROM login_sessions WHERE token_hash=? AND revoked_at IS NULL', [hash]); return r[0] || null; }
   async revokeSessionByTokenHash(hash) { await this.q('UPDATE login_sessions SET revoked_at=NOW() WHERE token_hash=?', [hash]); return true; }
+  async revokeSessionsByUserId(userId) { const r = await this.q('UPDATE login_sessions SET revoked_at=NOW() WHERE user_id=? AND revoked_at IS NULL', [userId]); return r.affectedRows || 0; }
   async getCheckpoint() { const r = await this.q('SELECT * FROM monitor_checkpoints WHERE network=?', [config.network]); return r[0] || { network: config.network, last_block_number: 0, last_block_hash: '' }; }
   async setCheckpoint(blockNumber, blockHash) { await this.q('INSERT INTO monitor_checkpoints (network,last_block_number,last_block_hash) VALUES (?,?,?) ON DUPLICATE KEY UPDATE last_block_number=VALUES(last_block_number), last_block_hash=VALUES(last_block_hash)', [config.network, blockNumber, blockHash || '']); return this.getCheckpoint(); }
 }

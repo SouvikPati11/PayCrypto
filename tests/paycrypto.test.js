@@ -532,20 +532,28 @@ test('hostinger: production + MEMORY_DB refuses to create a store (no silent mem
 });
 
 test('hostinger: app listens and /health + /ready are honest with a memory store', async () => {
-  const { app, checkReadiness } = require('../server/app');
-  const server = await new Promise((res) => { const s = app.listen(0, '127.0.0.1', () => res(s)); });
+  // Runs in a child process with MEMORY_DB=true, because the in-process
+  // config is already loaded (and may point at MySQL) by the time this
+  // test runs; the old in-process version only passed when the ambient
+  // shell happened to export MEMORY_DB=true or a MySQL answered on 3306.
+  const { spawn } = require('node:child_process');
+  const port = 32200 + Math.floor(Math.random() * 100);
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, PORT: String(port), NODE_ENV: 'development', MEMORY_DB: 'true', ENCRYPTION_KEY: 'a'.repeat(64) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   try {
-    const port = server.address().port;
-    await checkReadiness();
-    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
-    assert.equal(health.ok, true);
-    assert.equal(health.db_ready, true);
-    assert.equal(health.db, 'ready');
+    const { body } = await waitForHealth(port, 3000);
+    assert.equal(body.ok, true);
+    assert.equal(body.db_ready, true);
+    assert.equal(body.db, 'ready');
+    assert.equal(body.db_mode, 'memory');
     // deriver is not_configured in a fresh memory store (no wallet_xpub) — honest, not falsely 'ready'.
-    assert.equal(health.deriver, 'not_configured');
+    assert.equal(body.deriver, 'not_configured');
     const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
     assert.equal(readyRes.status, 200);
-  } finally { await new Promise((res) => server.close(res)); }
+  } finally { child.kill(); }
 });
 
 async function hostingerSpawnServer(port, dbPort) {
@@ -758,4 +766,67 @@ test('db auth: scripts/db-diagnose.js reports a sanitised failure and never prin
   assert.match(out, /ECONNREFUSED/);
   assert.match(out, /"user": "test"/);
   assert.doesNotMatch(out, /secret-password-must-not-leak/);
+});
+
+const { normalizeEmail, hashPassword: authHashPassword, verifyPassword } = require('../server/src/lib/auth');
+const { main: seedMain } = require('../scripts/seed-admin');
+
+test('auth: normalizeEmail trims and lowercases the same way at every boundary', () => {
+  assert.equal(normalizeEmail('  SouvikPati22@Gmail.COM  '), 'souvikpati22@gmail.com');
+  assert.equal(normalizeEmail('souvikpati22@gmail.com'), 'souvikpati22@gmail.com');
+  assert.equal(normalizeEmail(''), '');
+  assert.equal(normalizeEmail(null), '');
+});
+
+test('seed: normalises a pasted email, never trims the password, is idempotent', async () => {
+  const store = new MemoryStore();
+  process.env.ADMIN_EMAIL = '  SouvikPati22@Gmail.com  ';
+  process.env.ADMIN_PASSWORD = ' Space-Pass-42 ';
+  const first = await seedMain(store);
+  assert.equal(first.ok, true);
+  const user = await store.findUserByEmail('souvikpati22@gmail.com');
+  assert.ok(user, 'seeded admin is findable by the clean, normalised email');
+  assert.equal(user.role, 'super_admin');
+  assert.equal(user.status, 'active');
+  assert.equal(user.merchant_id, null);
+  // The password is stored exactly as given, spaces included.
+  assert.equal(await verifyPassword(' Space-Pass-42 ', user.password_hash), true);
+  assert.equal(await verifyPassword('Space-Pass-42', user.password_hash), false);
+  // Re-running never resets the password or duplicates the account.
+  const second = await seedMain(store);
+  assert.equal(second.alreadyExists, true);
+  const again = await store.findUserByEmail('souvikpati22@gmail.com');
+  assert.equal(again.id, user.id);
+  assert.equal(await verifyPassword(' Space-Pass-42 ', again.password_hash), true);
+  delete process.env.ADMIN_EMAIL;
+  delete process.env.ADMIN_PASSWORD;
+});
+
+test('seed: preserves a wallet_xpub / treasury_address that is already set', async () => {
+  const store = new MemoryStore();
+  await store.setSetting('wallet_xpub', 'xpub-preset-keep-me');
+  await store.setSetting('treasury_address', '0xTreasuryKeepMe');
+  process.env.ADMIN_EMAIL = 'seed-preserve@example.com';
+  process.env.ADMIN_PASSWORD = 'Seed-Preserve-42';
+  const r = await seedMain(store);
+  assert.equal(r.ok, true);
+  assert.equal(await store.getSetting('wallet_xpub'), 'xpub-preset-keep-me');
+  assert.equal(await store.getSetting('treasury_address'), '0xTreasuryKeepMe');
+  assert.equal(await store.getSetting('network'), 'testnet', 'missing keys still get their defaults');
+  delete process.env.ADMIN_EMAIL;
+  delete process.env.ADMIN_PASSWORD;
+});
+
+test('seed: refuses MEMORY_DB=true instead of creating a phantom in-memory admin', async () => {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['scripts/seed-admin.js'], {
+    cwd: __dirname + '/..',
+    env: { ...process.env, MEMORY_DB: 'true', ADMIN_EMAIL: 'phantom@example.com', ADMIN_PASSWORD: 'Phantom-Pass-42', NODE_ENV: 'development' },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const code = await new Promise((res) => child.on('close', res));
+  assert.equal(code, 2);
+  assert.match(out, /Refusing to seed with MEMORY_DB=true/);
 });

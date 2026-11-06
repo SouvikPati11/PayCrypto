@@ -112,6 +112,12 @@ scripts to dashboard pages without updating the CSP.
 - App won't start: check Node version (>=20), `npm install` output,
   and that `server/index.js` is the startup file.
 - "HD wallet not initialized": set `wallet_xpub` in settings.
+- Super admin login returns "Invalid credentials" although the account
+  exists: see `docs/ADMIN_RECOVERY.md` — the stored password is the one
+  that was hashed at seed time, and shell `$` expansion / trailing
+  whitespace at seed time are proven ways it can differ from the password
+  you believe you set. Reset it via `/admin-recover` with a recovery code
+  (no SSH/terminal needed); do not re-run the seed script to change it.
 - "No USDT contract configured for testnet": set
   `USDT_CONTRACT_TESTNET` after testnet BscScan verification.
 - Invoices created but never paid: check the cron log, the RPC URL,

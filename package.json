@@ -1,1 +1,36 @@
-{"dependencies":{"bcryptjs":"^2.4.3","cookie-parser":"^1.4.6","ethers":"^6.13.4","express":"^4.19.2","express-rate-limit":"^7.2.0","helmet":"^7.1.0","jsonwebtoken":"^9.0.2","mysql2":"^3.10.1","otplib":"^12.0.1"},"description":"PayCrypto — USDT (BEP20) payment gateway on BNB Smart Chain. Merchants, invoices, HD deposit addresses, ledger accounting, treasury sweeps and webhooks.","engines":{"node":">=20"},"license":"MIT","main":"server/index.js","name":"paycrypto","private":true,"scripts":{"dev":"NODE_ENV=development node server/index.js","init-wallet":"node scripts/init-wallet.js","migrate":"node scripts/migrate.js","monitor":"node scripts/monitor.js","deliver-webhooks":"node scripts/deliver-webhooks.js","signer":"node services/signer/index.js","init-signer-vault":"node scripts/init-signer-vault.js","request-sweep":"node scripts/request-sweep.js","request-withdrawal":"node scripts/request-withdrawal.js","seed":"node scripts/seed-admin.js","start":"node server/index.js","test":"node --test tests/paycrypto.test.js"},"version":"1.0.0"}
+{
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "ethers": "^6.13.4",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.10.1",
+    "otplib": "^12.0.1"
+  },
+  "description": "PayCrypto \u2014 USDT (BEP20) payment gateway on BNB Smart Chain. Merchants, invoices, HD deposit addresses, ledger accounting, treasury sweeps and webhooks.",
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "main": "server/index.js",
+  "name": "paycrypto",
+  "private": true,
+  "scripts": {
+    "dev": "NODE_ENV=development node server/index.js",
+    "init-wallet": "node scripts/init-wallet.js",
+    "migrate": "node scripts/migrate.js",
+    "monitor": "node scripts/monitor.js",
+    "deliver-webhooks": "node scripts/deliver-webhooks.js",
+    "signer": "node services/signer/index.js",
+    "init-signer-vault": "node scripts/init-signer-vault.js",
+    "request-sweep": "node scripts/request-sweep.js",
+    "request-withdrawal": "node scripts/request-withdrawal.js",
+    "seed": "node scripts/seed-admin.js",
+    "start": "node server/index.js",
+    "test": "node --test tests/paycrypto.test.js tests/auth-http.test.js"
+  },
+  "version": "1.0.0"
+}
